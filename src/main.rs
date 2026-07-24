@@ -1,11 +1,7 @@
-mod cli;
-mod db;
-mod error;
-
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Command};
 use tracing_subscriber::EnvFilter;
+use wiki_db::cli::{self, Cli, Command};
 
 fn main() -> Result<()> {
     // Initialize structured logging with sensible defaults.
