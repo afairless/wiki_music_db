@@ -4,3 +4,35 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+duckdb = { version = "1", features = ["bundled"] }
+
+# Async runtime (needed for Phase 7 incremental updates)
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+
+# Parquet intermediate format (arrow-rs)
+parquet = "59"
+
+# Logging & progress
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+indicatif = "0.18"
+
+# Compression
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Utilities
+regex = "1"
+chrono = { version = "0.4", features = ["serde"] }
