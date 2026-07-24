@@ -1,0 +1,5 @@
+music.duckdb
+*.duckdb
+parquet-dir/
+.env
+target/
