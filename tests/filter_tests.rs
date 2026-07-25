@@ -86,14 +86,14 @@ fn arb_claim() -> impl Strategy<Value = Claim> {
 /// Includes music-related properties (P106, P31, P1303, P175, P136, P358)
 /// plus non-music properties (P569, P1234) to test the catch-all threshold.
 const PROPERTY_IDS: &[&str] = &[
-    "P106",    // occupation
-    "P31",     // instance of
-    "P1303",   // instrument
-    "P175",    // performer
-    "P136",    // genre
-    "P358",    // discography
-    "P569",    // date of birth
-    "P1234",   // some unknown property
+    "P106",  // occupation
+    "P31",   // instance of
+    "P1303", // instrument
+    "P175",  // performer
+    "P136",  // genre
+    "P358",  // discography
+    "P569",  // date of birth
+    "P1234", // some unknown property
 ];
 
 /// Strategy: generate a random `HashMap<String, Vec<Claim>>`.

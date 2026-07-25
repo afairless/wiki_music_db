@@ -185,8 +185,7 @@ fn test_stream_mini_dump() {
 fn test_stream_mini_dump_count_entities() {
     let path = Path::new(MINI_DUMP_PATH);
     let mut reader = StreamReader::new(path).expect("Failed to open mini dump fixture");
-    let (processed, filtered, rejected) =
-        reader.count_entities().expect("count_entities failed");
+    let (processed, filtered, rejected) = reader.count_entities().expect("count_entities failed");
 
     assert_eq!(processed, 10, "Expected 10 processed");
     assert_eq!(filtered, 5, "Expected 5 filtered");
