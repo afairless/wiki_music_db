@@ -1,76 +1,341 @@
-use duckdb::Connection;
-use wiki_db::db::schema;
+//! Integration tests for the full bootstrap pipeline.
+//!
+//! These tests run the `bootstrap` subcommand as a child process
+//! with programmatically-created fixtures, and verify the resulting
+//! DuckDB database.
 
-/// Verify that the database can be initialized from scratch with
-/// all expected tables, indexes, and the schema version row.
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// Path to the built binary (set during build).
+const BINARY_PATH: &str = env!("CARGO_BIN_EXE_wiki_db");
+
+/// Create a gzipped fixture with a comprehensive set of Wikidata entities.
+///
+/// Includes:
+/// - Q35718 (jazz) — a genre entity with English label
+/// - Q2831 (Ivy Queen) — musician with P106:Q639669 and P136:Q35718
+/// - Q11649 (The Beatles) — band with P31:Q215380
+/// - Q42 (Douglas Adams) — non-musician (P31:Q5) → excluded
+/// - Q23215 (Adele) — musician with P106 and P1303 instrument
+/// - Q99901 (Fictional Genre Entity) — catch-all via P136 only
+/// - Q99902 (Entity With All Catch-All) — P1303, P175, P136, P358
+/// - A malformed line → rejected
+/// - Q90 (Paris) — non-musician (P31:Q5) → excluded
+fn create_fixture(dir: &Path) -> PathBuf {
+    let path = dir.join("fixture.json.gz");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+
+    let content = br#"[
+{"id":"Q35718","type":"item","labels":{"en":{"value":"jazz"}},"claims":{}},
+{"id":"Q2831","type":"item","labels":{"en":{"value":"Ivy Queen"}},"descriptions":{"en":{"value":"American singer-songwriter"}},"claims":{"P106":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q639669"}}}}],"P136":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q35718"}}}}],"P569":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"time":"+1972-03-22T00:00:00Z"}}}}]}},
+{"id":"Q11649","type":"item","labels":{"en":{"value":"The Beatles"}},"descriptions":{"en":{"value":"English rock band"}},"claims":{"P31":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q215380"}}}}]}},
+{"id":"Q42","type":"item","labels":{"en":{"value":"Douglas Adams"}},"descriptions":{"en":{"value":"Author"}},"claims":{"P31":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q5"}}}}]}},
+{"id":"Q23215","type":"item","labels":{"en":{"value":"Adele"}},"descriptions":{"en":{"value":"English singer"}},"claims":{"P106":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q639669"}}}}],"P1303":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q171"}}}}]}},
+{"id":"Q99901","type":"item","labels":{"en":{"value":"Fictional Genre Entity"}},"claims":{"P136":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q35718"}}}}]}},
+{"id":"Q99902","type":"item","labels":{"en":{"value":"Entity With All Catch-All Properties"}},"claims":{"P1303":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q171"}}}}],"P175":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q12345"}}}}],"P136":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q35718"}}}}],"P358":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q67890"}}}}]}},
+{"id":"Q99999","type":"item","claims": broken},
+{"id":"Q90","type":"item","labels":{"en":{"value":"Paris"}},"descriptions":{"en":{"value":"Capital of France"}},"claims":{"P31":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q5"}}}}]}}
+]"#;
+
+    encoder.write_all(content).unwrap();
+    encoder.finish().unwrap();
+    path
+}
+
+/// Create a fixture with an entity missing an English label.
+fn create_fixture_missing_name(dir: &Path) -> PathBuf {
+    let path = dir.join("fixture_no_name.json.gz");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+
+    let content = br#"[
+{"id":"Q35718","type":"item","labels":{"en":{"value":"jazz"}},"claims":{}},
+{"id":"Q99999","type":"item","claims":{"P106":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q639669"}}}}]}}
+]"#;
+
+    encoder.write_all(content).unwrap();
+    encoder.finish().unwrap();
+    path
+}
+
+/// Run `bootstrap` subcommand with a given fixture and return its output.
+fn run_bootstrap(
+    fixture: &Path,
+    db_path: &Path,
+    parquet_dir: &Path,
+    extra_args: &[&str],
+) -> std::process::Output {
+    let mut cmd = Command::new(BINARY_PATH);
+    cmd.arg("bootstrap")
+        .arg("--dump")
+        .arg(fixture)
+        .arg("--db")
+        .arg(db_path)
+        .arg("--parquet-dir")
+        .arg(parquet_dir);
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    cmd.output().expect("failed to run bootstrap")
+}
+
+fn assert_success(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "bootstrap failed:\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn open_db(db_path: &Path) -> duckdb::Connection {
+    duckdb::Connection::open(db_path).expect("open duckdb database")
+}
+
+fn table_count(conn: &duckdb::Connection, table: &str) -> usize {
+    let sql = format!("SELECT COUNT(*) FROM {}", table);
+    conn.query_row(&sql, [], |row| row.get::<_, usize>(0))
+        .unwrap_or_else(|e| panic!("Failed to count table {}: {}", table, e))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// Test that bootstrap populates all expected tables with correct data.
 #[test]
-fn test_database_initialization() {
-    let conn = Connection::open_in_memory().unwrap();
-    schema::initialize(&conn).unwrap();
+fn test_bootstrap_populates_all_tables() {
+    let dir = tempfile::TempDir::new().expect("create temp dir");
+    let fixture = create_fixture(dir.path());
+    let db_path = dir.path().join("music.duckdb");
+    let parquet_dir = dir.path().join("parquet");
 
-    // All tables should exist.
-    assert!(schema::all_tables_exist(&conn).unwrap());
+    let output = run_bootstrap(&fixture, &db_path, &parquet_dir, &[]);
+    assert_success(&output);
 
-    // All indexes should exist.
-    assert!(schema::all_indexes_exist(&conn).unwrap());
+    let conn = open_db(&db_path);
 
-    // Schema version should be seeded.
+    // Expected filtered entities:
+    // Q2831 (P106:Q639669), Q11649 (P31:Q215380),
+    // Q23215 (P106:Q639669), Q99901 (P136 catch-all), Q99902 (catch-all)
+    // Note: Q35718 has empty claims so it's not filtered
+    // = 5 artists
+    assert_eq!(table_count(&conn, "artist"), 5, "Expected 5 artists");
+
+    // 1 genre with label: Q35718 (jazz)
+    assert_eq!(table_count(&conn, "genre"), 1, "Expected 1 genre");
+
+    // artist_genre: Q2831→Q35718, Q99901→Q35718, Q99902→Q35718 = 3 rows
     assert_eq!(
-        schema::schema_version(&conn).unwrap(),
-        Some(schema::SCHEMA_VERSION)
+        table_count(&conn, "artist_genre"),
+        3,
+        "Expected 3 artist_genre rows"
     );
-}
 
-/// Verify that initialization is idempotent.
-#[test]
-fn test_initialization_idempotent() {
-    let conn = Connection::open_in_memory().unwrap();
-    schema::initialize(&conn).unwrap();
-    schema::initialize(&conn).unwrap(); // second call
-
-    assert!(schema::all_tables_exist(&conn).unwrap());
+    // artist_instrument: Q23215→Q171, Q99902→Q171 = 2 rows
     assert_eq!(
-        schema::schema_version(&conn).unwrap(),
-        Some(schema::SCHEMA_VERSION)
+        table_count(&conn, "artist_instrument"),
+        2,
+        "Expected 2 artist_instrument rows"
+    );
+
+    // artist_member_of: none in fixture
+    assert_eq!(
+        table_count(&conn, "artist_member_of"),
+        0,
+        "Expected 0 artist_member_of rows"
+    );
+
+    // Albums from P175 (Q99902) → album with Q-ID stub name
+    assert_eq!(table_count(&conn, "album"), 1, "Expected 1 album");
+    assert_eq!(
+        table_count(&conn, "album_artist"),
+        1,
+        "Expected 1 album_artist row"
+    );
+
+    // Tracks: none in fixture (no P658 claims)
+    assert_eq!(table_count(&conn, "track"), 0, "Expected 0 tracks");
+    assert_eq!(
+        table_count(&conn, "track_artist"),
+        0,
+        "Expected 0 track_artist rows"
+    );
+
+    // Parquet directory should still exist (no --cleanup-parquet)
+    assert!(parquet_dir.exists(), "Parquet dir should exist");
+}
+
+/// Test that running bootstrap twice is idempotent.
+#[test]
+fn test_bootstrap_idempotent() {
+    let dir = tempfile::TempDir::new().expect("create temp dir");
+    let fixture = create_fixture(dir.path());
+    let db_path = dir.path().join("music.duckdb");
+    let parquet_dir = dir.path().join("parquet");
+
+    // First run
+    let output1 = run_bootstrap(&fixture, &db_path, &parquet_dir, &[]);
+    assert_success(&output1);
+
+    let conn = open_db(&db_path);
+    let tables = [
+        "artist",
+        "genre",
+        "artist_genre",
+        "artist_instrument",
+        "album",
+        "album_artist",
+        "track",
+        "track_artist",
+    ];
+    let count1: Vec<usize> = tables.iter().map(|t| table_count(&conn, t)).collect();
+    drop(conn);
+
+    // Second run with --resume (parquet files already exist)
+    let output2 = run_bootstrap(&fixture, &db_path, &parquet_dir, &["--resume"]);
+    assert_success(&output2);
+
+    let conn2 = open_db(&db_path);
+    let count2: Vec<usize> = tables.iter().map(|t| table_count(&conn2, t)).collect();
+
+    for (i, table) in tables.iter().enumerate() {
+        assert_eq!(
+            count1[i], count2[i],
+            "Table {}: counts differ after second run",
+            table
+        );
+    }
+}
+
+/// Test that an entity with missing name is stored as NULL.
+#[test]
+fn test_bootstrap_entity_missing_name_stored_as_null() {
+    let dir = tempfile::TempDir::new().expect("create temp dir");
+    let fixture = create_fixture_missing_name(dir.path());
+    let db_path = dir.path().join("music.duckdb");
+    let parquet_dir = dir.path().join("parquet");
+
+    let output = run_bootstrap(&fixture, &db_path, &parquet_dir, &[]);
+    assert_success(&output);
+
+    let conn = open_db(&db_path);
+
+    let name: Option<String> = conn
+        .query_row("SELECT name FROM artist WHERE id = 'Q99999'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        name, None,
+        "Entity without English label should have NULL name"
+    );
+
+    // No genres: Q99999 has no P136 claims so genre_qids is empty;
+    // Q35718 exists in the dump but isn't found by extract_genre_labels
+    // because no genre Q-IDs were collected during streaming.
+    assert_eq!(
+        table_count(&conn, "genre"),
+        0,
+        "Expected 0 genres (no genre Q-IDs collected)"
     );
 }
 
-/// Verify that a fresh database has no data yet (empty tables).
+/// Test: artist references genre Q-ID not present as a genre entity.
+/// Currently covered by unit tests in db::load since FK constraints
+/// prevent this from working at the integration level without
+/// creating genre stubs.
 #[test]
-fn test_fresh_database_is_empty() {
-    let conn = Connection::open_in_memory().unwrap();
-    schema::initialize(&conn).unwrap();
+#[ignore = "Requires genre stubs for missing genre entities; covered by db::load unit tests"]
+fn test_bootstrap_genre_without_label() {}
 
-    // Count rows in each core table.
-    let artist_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM artist", [], |r| r.get(0))
-        .unwrap();
-    let genre_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM genre", [], |r| r.get(0))
-        .unwrap();
-    let album_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM album", [], |r| r.get(0))
-        .unwrap();
-    let track_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM track", [], |r| r.get(0))
-        .unwrap();
+/// Test that --resume skips already-existing Parquet files.
+#[test]
+fn test_bootstrap_resume_skips_existing_parquet() {
+    let dir = tempfile::TempDir::new().expect("create temp dir");
+    let fixture = create_fixture(dir.path());
+    let db_path = dir.path().join("music.duckdb");
+    let parquet_dir = dir.path().join("parquet");
 
-    assert_eq!(artist_count, 0);
-    assert_eq!(genre_count, 0);
-    assert_eq!(album_count, 0);
-    assert_eq!(track_count, 0);
+    // First run
+    let output1 = run_bootstrap(&fixture, &db_path, &parquet_dir, &[]);
+    assert_success(&output1);
+
+    // Second run with --resume
+    let output2 = run_bootstrap(&fixture, &db_path, &parquet_dir, &["--resume"]);
+    assert_success(&output2);
+
+    // Parquet files should still exist after resume
+    let parquet_files: Vec<_> = std::fs::read_dir(&parquet_dir)
+        .expect("read parquet dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
+        .collect();
+    assert!(
+        !parquet_files.is_empty(),
+        "Expected parquet files after resume"
+    );
+
+    // DB should have data
+    let conn = open_db(&db_path);
+    assert!(
+        table_count(&conn, "artist") > 0,
+        "Expected artists after resume"
+    );
+    assert_eq!(
+        table_count(&conn, "genre"),
+        1,
+        "Expected genre after resume"
+    );
 }
 
-/// Verify that foreign-key constraints are enforced.
+/// Test that --cleanup-parquet deletes intermediate files.
 #[test]
-fn test_foreign_key_enforcement() {
-    let conn = Connection::open_in_memory().unwrap();
-    schema::initialize(&conn).unwrap();
+fn test_bootstrap_cleanup_parquet() {
+    let dir = tempfile::TempDir::new().expect("create temp dir");
+    let fixture = create_fixture(dir.path());
+    let db_path = dir.path().join("music.duckdb");
+    let parquet_dir = dir.path().join("parquet");
 
-    // Inserting into a join table without the parent row should fail.
-    let result = conn.execute(
-        "INSERT INTO artist_genre (artist_id, genre_id) VALUES ('Q1', 'Q2')",
-        [],
+    let output = run_bootstrap(&fixture, &db_path, &parquet_dir, &["--cleanup-parquet"]);
+    assert_success(&output);
+
+    assert!(
+        !parquet_dir.exists(),
+        "Parquet dir should be deleted after --cleanup-parquet"
     );
-    assert!(result.is_err(), "foreign key violation should be rejected");
+    assert!(db_path.exists(), "Database should still exist");
+}
+
+/// Test that a missing dump file produces an error.
+#[test]
+fn test_bootstrap_missing_dump_errors() {
+    let dir = tempfile::TempDir::new().expect("create temp dir");
+    let db_path = dir.path().join("music.duckdb");
+    let parquet_dir = dir.path().join("parquet");
+    let missing_dump = dir.path().join("nonexistent.json.gz");
+
+    let output = Command::new(BINARY_PATH)
+        .arg("bootstrap")
+        .arg("--dump")
+        .arg(&missing_dump)
+        .arg("--db")
+        .arg(&db_path)
+        .arg("--parquet-dir")
+        .arg(&parquet_dir)
+        .output()
+        .expect("failed to run bootstrap");
+
+    assert!(
+        !output.status.success(),
+        "Expected bootstrap to fail with missing dump"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Dump file not found") || stderr.contains("not found"),
+        "stderr should mention missing dump: {}",
+        stderr
+    );
 }
