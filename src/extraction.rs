@@ -308,6 +308,94 @@ pub fn extract_genre_entity(entity: &Entity) -> Option<GenreEntry> {
     Some(GenreEntry { id, name })
 }
 
+/// Second-pass genre label extraction from a Wikidata JSONrom a Wikidata JSON dump.
+///
+/// Streams through the dump file and extracts English labels for all
+/// entities whose Q-ID is in `genre_qids`. This is intended to be called
+/// after the initial filtering pass (Phase 2b/3a) to resolve genre Q-ID
+/// references to human-readable labels.
+///
+/// Returns a vector of `GenreEntry` records with valid IDs and labels.
+/// Genre entities without English labels are silently skipped.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file cannot be opened, or a JSON parse
+/// error if the dump format is invalid.
+pub fn extract_genre_labels(
+    dump_path: &std::path::Path,
+    genre_qids: &HashSet<String>,
+) -> Result<Vec<GenreEntry>, crate::error::Error> {
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(dump_path).map_err(|e| crate::error::Error::Io {
+        source: e,
+        path: dump_path.to_path_buf(),
+    })?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut reader = std::io::BufReader::new(decoder);
+
+    let mut genres: Vec<GenreEntry> = Vec::new();
+    let mut line_buf = String::new();
+    let mut line_number: u64 = 0;
+
+    loop {
+        line_buf.clear();
+        let bytes_read = reader
+            .read_line(&mut line_buf)
+            .map_err(|e| crate::error::Error::Io {
+                source: e,
+                path: dump_path.to_path_buf(),
+            })?;
+
+        if bytes_read == 0 {
+            break; // EOF
+        }
+
+        line_number += 1;
+        let trimmed = line_buf.trim();
+
+        // Skip JSON delimiters and empty lines
+        if trimmed == "[" || trimmed == "]" || trimmed.is_empty() {
+            continue;
+        }
+
+        // Strip trailing comma
+        let line = trimmed.trim_end_matches(',');
+
+        // Quick check: does this line contain any of our genre Q-IDs?
+        // Performance optimization: skip deserialization if no genre Q-ID appears
+        if !genre_qids.iter().any(|qid| line.contains(qid.as_str())) {
+            continue;
+        }
+
+        match serde_json::from_str::<Entity>(line) {
+            Ok(entity) => {
+                if genre_qids.contains(&entity.id) {
+                    if let Some(entry) = extract_genre_entity(&entity) {
+                        genres.push(entry);
+                    } else {
+                        tracing::warn!(
+                            entity_id = %entity.id,
+                            line = line_number,
+                            "Genre entity has no English label, skipping"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    line = line_number,
+                    reason = %e,
+                    "Failed to parse line during genre extraction"
+                );
+            }
+        }
+    }
+
+    Ok(genres)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
