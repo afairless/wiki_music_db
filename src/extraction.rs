@@ -55,7 +55,7 @@ pub struct MusicEntity {
 }
 
 /// Reference to an album with an optional role.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct AlbumRef {
     /// The album's Wikidata Q-ID.
     pub album_id: String,
@@ -64,7 +64,7 @@ pub struct AlbumRef {
 }
 
 /// Reference to a track with an optional role.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TrackRef {
     /// The track's Wikidata Q-ID.
     pub track_id: String,
