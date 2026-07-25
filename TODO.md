@@ -1,179 +1,132 @@
-# Implementation Plan: Phase 2a — Wikidata Entity Model & Deserialization
+# Implementation Plan: Phase 2b — Filter & Streaming Parser
 
-Source: `docs/research/2026-07_music_db_rust_plan.md` (Phase 2a only)
+Source: `docs/research/2026-07_music_db_rust_plan.md` (Phase 2b only)
 
-This plan covers **Phase 2a only**. Phases 1, 2b, 3a, 3b, 5, 6, 7, and 8 are **out of scope**. Do not implement any code belonging to those phases.
+This plan covers **Phase 2b only**. Phases 1, 2a, 3a, 3b, 5, 6, 7, and 8 are **out of scope**. Do not implement any code belonging to those phases.
 
 ## Summary
 
-Define the `serde` structs for Wikidata JSON entities and implement deserialization with a custom `Deserialize` implementation for `Statement`/`Mainsnak` that handles the three `snaktype` variants (`value`, `novalue`, `somevalue`). Only `mainsnak.datavalue.value.id` (for Q-ID references) and `mainsnak.datavalue.value.time` (for dates) are captured; qualifiers and references are ignored entirely for v1.
+Stream `latest-all.json.gz` line-by-line, apply the music entity filter with inclusion-reason tracking, and expose a streaming parser that yields filtered entities. The filter checks three criteria in order: music occupation (P106), music group type (P31), and a catch-all heuristic over music-related properties (P1303, P175, P136, P358). Every included entity records why it passed the filter so `artist.inclusion_reason` can be populated during loading.
 
-**Deliverable:** `cargo test` passes; entity deserialization from hand-crafted fixtures works.
+**Deliverable:** `cargo test` passes; can stream a test fixture file and print filtered entity counts with inclusion reasons.
 
 ## Steps
 
 | # | Commit message | Logical unit | Key deliverables | Tests |
 |---|---|---|---|---|
-| 1 | `chore: scaffold wikidata module skeleton` | Wikidata module setup | `src/wikidata/mod.rs`, `src/lib.rs` (updated) | — |
-| 2 | `feat: define Wikidata entity model with serde structs` | Entity model types | `src/wikidata/model.rs` | Unit |
-| 3 | `feat: implement custom Deserialize for Wikidata Statement claims` | Custom claim deserializer | `src/wikidata/model.rs` (updated) | Unit |
-| 4 | `test: add JSON fixture files for Wikidata entity tests` | Test fixtures | `tests/fixtures/musician_entity.json`, `tests/fixtures/band_entity.json`, `tests/fixtures/non_musician_entity.json`, `tests/fixtures/malformed_entity.json` | — |
-| 5 | `test: add unit tests for Wikidata entity deserialization` | Deserialization tests | `src/wikidata/model.rs` (updated) | Unit |
+| 1 | `feat: implement music entity filter with inclusion reason tracking` | Music entity filter | `src/wikidata/filter.rs`, `src/wikidata/mod.rs` (updated) | Unit |
+| 2 | `feat: implement streaming gzip parser for Wikidata dump` | Streaming parser | `src/wikidata/stream.rs`, `src/wikidata/mod.rs` (updated) | Unit |
+| 3 | `test: add property-based and integration tests for filter and stream` | Extended tests | `tests/property/filter_tests.rs`, `tests/fixtures/mini_dump.json.gz` | Property-based, Integration |
 
-### Step 1 — Scaffold wikidata module skeleton
+### Step 1 — Implement music entity filter
 
-- Create `src/wikidata/mod.rs`:
+Create `src/wikidata/filter.rs` containing the `is_music_entity()` predicate and inclusion-reason tracking. Update `src/wikidata/mod.rs` to export `pub mod filter;`.
+
+**Key design decisions:**
+
+- The filter returns a `FilterResult` enum — either `Included(String)` with the reason string, or `Excluded`. This captures why an entity was included so the reason can be stored in the `artist.inclusion_reason` column during Phase 3b loading.
+- Reason strings follow the conventions from the plan: `"P106:Q639669"` (matched a specific occupation), `"P31:Q215380"` (matched a specific group type), `"PROP:P1303,P136"` (matched catch-all properties).
+- The three checks are ordered by precision: occupation → group type → catch-all. The first match wins.
+- A private helper `fn claim_target_id(claim: &Claim) -> Option<&str>` extracts the target Q-ID from a claim's mainsnak datavalue, drilling through `claim.mainsnak.as_ref()?.datavalue.as_ref()?.id.as_deref()`.
+
+**Inline unit tests (directly in `filter.rs` under `#[cfg(test)]`):**
+
+- `test_empty_claims_excluded`: empty claims map → `FilterResult::Excluded`
+- `test_single_occupation_included`: single `P106` claim with `Q639669` → `FilterResult::Included("P106:Q639669")`
+- `test_single_group_included`: single `P31` claim with `Q215380` → `FilterResult::Included("P31:Q215380")`
+- `test_multiple_music_claims`: multiple P106 and P31 claims with music Q-IDs → `Included`
+- `test_multiple_non_music_claims`: claims present but no music Q-IDs, no catch-all properties → `Excluded`
+- `test_catchall_single_property_included`: exactly 1 catch-all property (e.g. `P136`) → `Included` (threshold is 1)
+- `test_catchall_no_match`: no P106, no P31, and 0 out of 4 catch-all properties → `Excluded`
+- `test_catchall_multiple_properties`: 3 catch-all properties present → `Included("PROP:P1303,P136,P358")` (sorted order)
+- `test_no_claims_field`: claims HashMap is empty → `Excluded`
+- `test_claim_without_mainsnak`: claim exists but mainsnak is `None` → ignored for occupation check, falls through to other checks
+
+### Step 2 — Implement streaming gzip parser
+
+Create `src/wikidata/stream.rs` containing the streaming parser. Update `src/wikidata/mod.rs` to export `pub mod stream;`.
+
+**Key design decisions:**
+
+- Define a `StreamReader` struct that owns a `BufReader<GzDecoder<File>>`, an internal line buffer (`String`), and a `u64` line counter.
+- A `StreamEvent` enum models each parsed line:
 
   ```rust
-  pub mod model;
-  ```
-
-- In `src/lib.rs`, add `pub mod wikidata;` alongside the existing `pub mod cli;`, `pub mod db;`, `pub mod error;`.
-- Verify `cargo build` compiles cleanly.
-
-### Step 2 — Define Wikidata entity model structs
-
-In `src/wikidata/model.rs`, define serde-deriving structs for the top-level Wikidata JSON entity structure:
-
-- **`Entity`** — `{ id, type, labels, descriptions, claims }`
-  - `id: String` — Wikidata Q-ID (e.g. `"Q2831"`)
-  - `entity_type: String` — `"item"` (serde rename: `type`)
-  - `labels: Option<Labels>`
-  - `descriptions: Option<Descriptions>`
-  - `claims: HashMap<String, Vec<Claim>>` with `#[serde(default)]`
-
-- **`Labels`** — A newtype over `HashMap<String, LanguageValue>` with a custom accessor `fn en(&self) -> Option<&str>` that returns the English label value.
-
-- **`Descriptions`** — A newtype over `HashMap<String, LanguageValue>` with a custom accessor `fn en(&self) -> Option<&str>` that returns the English description value.
-
-- **`LanguageValue`** — `{ value: String }`
-
-- **`Claim`** — `{ mainsnak: Mainsnak }`. Use `#[serde(flatten)]` to absorb extra fields (`id`, `rank`, `qualifiers`, `references`, etc.) into an `HashMap<String, serde_json::Value>` with `#[serde(default)]`. The key field is `mainsnak`.
-
-- **`Mainsnak`** — a placeholder using serde-derive (will get custom deserializer in Step 3):
-
-  ```rust
-  #[derive(Debug, Clone, PartialEq, Deserialize)]
-  pub struct Mainsnak {
-      pub snaktype: String,
-      pub datavalue: Option<Datavalue>,
+  pub enum StreamEvent {
+      Filtered(FilteredEntity),
+      Rejected { line: u64, reason: String, raw: Option<String> },
+      Skipped, // JSON delimiters [ , ]
   }
   ```
 
-- **`Datavalue`** — `{ datavalue_type: String, value: serde_json::Value }` with serde rename `type` → `datavalue_type`.
-
-- **`EntityValue`** — pre-defined for Step 3:
+- A `FilteredEntity` struct pairs the deserialized `Entity` with its inclusion reason:
 
   ```rust
-  #[derive(Debug, Clone, PartialEq, Deserialize)]
-  pub struct EntityValue {
-      #[serde(default)]
-      pub id: Option<String>,
-      #[serde(default)]
-      pub time: Option<String>,
+  pub struct FilteredEntity {
+      pub entity: Entity,
+      pub inclusion_reason: String,
   }
   ```
 
-Write unit tests (inline `#[cfg(test)] mod tests` in `model.rs`):
+- `StreamReader::new(path: &Path) -> Result<Self>` opens the gzip file:
+  - `File::open(path)` → `GzDecoder::new(file)` → `BufReader::new(decoder)`
+- `StreamReader::next_event(&mut self) -> Result<Option<StreamEvent>>` reads one line at a time:
+  1. Read a line into the internal buffer
+  2. Check for EOF → return `Ok(None)`
+  3. Increment line counter
+  4. Trim whitespace; skip `[` and `]` delimiter lines → return `Ok(Some(StreamEvent::Skipped))`
+  5. Strip trailing comma: `line.trim_end_matches(',')`
+  6. Try `serde_json::from_str::<Entity>(&line)`:
+     - On success: call `is_music_entity(&entity.claims)`. If `Included(reason)`, yield `StreamEvent::Filtered(FilteredEntity { entity, inclusion_reason: reason })`. If `Excluded`, skip silently (caller may want counters — tracked via a separate counter).
+     - On error: yield `StreamEvent::Rejected { line, reason: error.to_string(), raw: Some(line.clone()) }`
+- A helper `StreamReader::count_entities(&mut self) -> Result<(u64, u64, u64)>` provides a convenience method that drains the stream and returns `(processed, filtered, rejected)` counts.
+- Use `tracing::warn!` for rejected lines (with the reason and line number) so callers can optionally write to `rejected.jsonl`.
 
-- **Round-trip:** Serialize a known `Entity` to JSON, deserialize back, verify fields match.
-- **Empty claims:** Deserialize an entity with no `claims` field — verify it defaults to an empty map.
-- **Missing labels:** Deserialize JSON with no `labels` field — verify `labels` is `None`.
-- **Entity with `type` field:** Verify the `type` field maps to `entity_type`.
+**Inline unit tests (in `stream.rs` under `#[cfg(test)]`):**
 
-### Step 3 — Implement custom Deserialize for Wikidata claims
+- Use a temporary gzip file created in the test via `flate2::write::GzEncoder`:
+  - `test_stream_single_musician`: Write a 2-line JSON array (1 musician, 1 non-musician), stream it → verify 1 filtered result, correct Q-ID and inclusion reason
+  - `test_stream_empty_array`: Write `[ ]` → zero events
+  - `test_stream_all_excluded`: Write entities with no music claims → zero filtered events
+  - `test_stream_malformed_line`: Write one valid entity + one truncated JSON line → verify the valid entity is yielded and a `Rejected` event is emitted for the malformed line
+  - `test_stream_strips_trailing_comma`: Write `[ { ... },` (entity with trailing comma between array elements) → deserialization succeeds
 
-Replace the serde-derived `Deserialize` on `Mainsnak` with a custom implementation. The Wikidata claim JSON structure varies by `snaktype`:
+### Step 3 — Add property-based and integration tests
 
-- **`value`** — `mainsnak.datavalue.value` contains a typed object (e.g. `{ "type": "wikibase-entityid", "value": { "id": "Q639669", ... } }` or `{ "type": "time", "value": { "time": "+1926-09-23T00:00:00Z", ... } }`).
-- **`novalue`** — `mainsnak.datavalue` is `null`; the claim says "no value".
-- **`somevalue`** — `mainsnak.datavalue` is `null`; the claim says "some value" (unknown).
+#### Property-based tests (`tests/property/filter_tests.rs`)
 
-The custom deserializer should:
+- The test module **must not** require `proptest` or `quickcheck` as public dependencies. Add `proptest = "1"` to `[dev-dependencies]` in `Cargo.toml`.
+- Strategy: generate a random `HashMap<String, Vec<Claim>>` where:
+  - Keys are drawn from a small set of property IDs (`"P106"`, `"P31"`, `"P1303"`, `"P175"`, `"P136"`, `"P358"`, `"P569"`, `"P1234"`)
+  - Values are random-length `Vec<Claim>` with random `mainsnak` configurations (some with `Some(Q-ID)` matching music Q-IDs, some with non-music Q-IDs, some with `None`)
+  - Use a custom `Arbitrary` impl or compose strategies directly with `prop::collection::hash_map` and `prop::collection::vec`
+- **Properties to test:**
+  - `filter_never_panics`: For any generated input, `is_music_entity(&claims)` never panics (always returns a `FilterResult`)
+  - `filter_consistent_with_precision_order`: If P106 matches a music occupation and P31 matches a music group, the reason starts with `"P106:"` (occupation check fires first)
+  - `filter_catchall_includes_when_threshold_met`: When the claims contain `N` catch-all properties where `N >= MIN_CATCHALL_PROPERTIES` (and no P106/P31 match), result is `Included` with reason starting with `"PROP:"`
+  - `filter_catchall_excludes_below_threshold`: When the claims contain `N` catch-all properties where `N < MIN_CATCHALL_PROPERTIES` (and no P106/P31 match), result is `Excluded`
 
-1. Parse `snaktype` first (as a `String`).
-2. If `snaktype == "value"`, parse `datavalue` as a `serde_json::Value`, extract the nested `value` object, and try to parse it as `EntityValue` (which captures `id` and `time` as optional fields). If `datavalue` is missing or null, treat as `None`.
-3. If `snaktype` is `"novalue"` or `"somevalue"`, set `datavalue` to `None`.
-4. Silently ignore all other fields (`id`, `rank`, `qualifiers`, `references`, `hash`, etc.).
+#### Integration test — mini dump fixture (`tests/fixtures/mini_dump.json.gz`)
 
-Define the final `Mainsnak` struct (no derive-Deserialize):
+Create `tests/fixtures/mini_dump.json.gz` — a small hand-crafted gzipped Wikidata dump containing ~8–12 entities:
 
-```rust
-#[derive(Debug, Clone, PartialEq)]
-pub struct Mainsnak {
-    pub snaktype: String,
-    pub datavalue: Option<DatavalueValue>,
-}
+1. **Musician** (Ivy Queen, `Q2831`) — P106:musician, P136:reggaeton → included
+2. **Band** (The Beatles, `Q11649`) — P31:musical group → included
+3. **Non-musician** (Douglas Adams, `Q42`) — P31:human only → excluded
+4. **Singer with instrument** (Adele, `Q23215`) — P106:singer + P1303:vocalist → included (occupation reason)
+5. **Entity with only catch-all** (a fictional entity with P136 genre but no P106/P31) → included via catch-all
+6. **Entity with all 4 catch-all properties** (P1303 + P175 + P136 + P358, but no P106/P31) → included
+7. **Entity with no music properties at all** (a location like `Q90` Paris) → excluded
+8. **Malformed last line** (truncated JSON as the final entry) → rejected
 
-/// The extracted value from a mainsnak's datavalue.
-/// Only `id` (for Q-ID references) and `time` (for dates) are captured.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct DatavalueValue {
-    pub id: Option<String>,
-    pub time: Option<String>,
-}
-```
+The fixture is in Wikidata dump format: `[` on first line, comma-separated JSON objects, `]` on last line. Each entity is a proper `Entity`-compatible JSON object.
 
-Update `Claim` to reference `DatavalueValue` instead of `Datavalue`. Remove or keep `Datavalue` as unused (it was only a Step 2 bridge).
+**Integration test(s)** (add to `tests/bootstrap_test.rs` or create `tests/stream_test.rs`):
 
-The custom deserializer uses `serde::de::MapAccess` and `serde::de::Visitor` pattern. Use `serde_json::from_value` for the nested `value` parsing inside the `"value"` branch.
-
-Write inline unit tests:
-
-- **Value snaktype with entity ID:** Parse `{ "snaktype": "value", "datavalue": { "value": { "id": "Q639669" } } }` → `snaktype = "value"`, `datavalue = Some(DatavalueValue { id: Some("Q639669"), time: None })`.
-- **Value snaktype with time:** Parse `{ "snaktype": "value", "datavalue": { "value": { "time": "+1926-09-23T00:00:00Z" } } }` → `datavalue = Some(DatavalueValue { id: None, time: Some("+1926-09-23T00:00:00Z") })`.
-- **Novalue snaktype:** Parse `{ "snaktype": "novalue" }` → `datavalue = None`.
-- **Somevalue snaktype:** Parse `{ "snaktype": "somevalue" }` → `datavalue = None`.
-- **Full claim with ignored fields:** Parse a rich claim with `id`, `rank`, `qualifiers`, `references` — verify only `mainsnak` is captured correctly and extra fields are silently ignored.
-- **Entity with P106 claim:** Deserialize the full musician fixture inline — verify `claims["P106"]` has one entry with `mainsnak.datavalue` containing `id = Some("Q639669")`.
-
-### Step 4 — Add JSON fixture files
-
-Create the following test fixtures in `tests/fixtures/`:
-
-1. **`musician_entity.json`** — A hand-crafted Wikidata entity representing a musician (Ivy Queen, Q2831):
-   - `id: "Q2831"`, `type: "item"`
-   - `labels.en.value: "Ivy Queen"`
-   - `descriptions.en.value: "American singer-songwriter and musician"`
-   - `claims` with:
-     - `P106` → value snaktype → `{ "id": "Q639669" }` (musician occupation)
-     - `P31` → value snaktype → `{ "id": "Q5" }` (human)
-     - `P136` → value snaktype → `{ "id": "Q35718" }` (reggaeton genre)
-     - `P569` → value snaktype with time `"+1972-03-22T00:00:00Z"` (date of birth)
-
-2. **`band_entity.json`** — A hand-crafted entity representing a band (The Beatles, Q11649):
-   - `id: "Q11649"`, `type: "item"`
-   - `labels.en.value: "The Beatles"`
-   - `descriptions.en.value: "English rock band"`
-   - `claims` with:
-     - `P31` → value snaktype → `{ "id": "Q215380" }` (musical group)
-     - `P136` → value snaktype → `{ "id": "Q57251" }` (rock music genre)
-     - `P571` → value snaktype with time `"+1960-01-01T00:00:00Z"` (inception date)
-     - No `P106` claims.
-
-3. **`non_musician_entity.json`** — A non-music entity (Douglas Adams, Q42):
-   - `id: "Q42"`, `type: "item"`
-   - `labels.en.value: "Douglas Adams"`
-   - `descriptions.en.value: "English author and humorist"`
-   - `claims` with:
-     - `P31` → value snaktype → `{ "id": "Q5" }` (human) only
-     - No `P106`, `P1303`, `P175`, `P136`, or `P358` claims.
-
-4. **`malformed_entity.json`** — A deliberately malformed JSON line (truncated JSON):
-   - Content: `{"id":"Q1","type":"item","labels":{...` (no closing braces — deliberately incomplete).
-
-### Step 5 — Add unit tests for entity deserialization
-
-Add comprehensive tests in `src/wikidata/model.rs` (in a `#[cfg(test)] mod tests` block). These tests load fixtures via `include_str!` or `std::fs::read_to_string`.
-
-Tests to write:
-
-- **Load musician fixture:** Deserialize `musician_entity.json` → verify `Entity.id == "Q2831"`, `labels.en() == Some("Ivy Queen")`, `descriptions.en() == Some("American singer-songwriter and musician")`, `entity_type == "item"`.
-- **Load band fixture:** Deserialize `band_entity.json` → verify `Entity.id == "Q11649"`, `labels.en() == Some("The Beatles")`, `claims["P31"][0].mainsnak.datavalue == Some(DatavalueValue { id: Some("Q215380"), time: None })`.
-- **Load non-musician fixture:** Deserialize `non_musician_entity.json` → verify `Entity.id == "Q42"`, `claims` has no `P106`, `P1303`, `P175`, `P136`, or `P358` keys.
-- **Malformed JSON line:** Deserialize `malformed_entity.json` → verify it returns a `serde_json::Error`, test asserts `is_err()`.
-- **Entity missing `labels.en`:** Deserialize JSON with an empty `labels` object (`{}`) or missing `en` key → verify `entity.labels.en() == None`, no panic.
-- **Entity where `P106` claim has no `mainsnak`:** Construct JSON where a `P106` entry exists but `mainsnak` is missing or `null` → verify deserialization succeeds with the entity, and that `claims["P106"]` has an entry with `mainsnak` set to some default/fallback.
-- **Date value that is invalid:** Construct a claim with an invalid time string (e.g. `"not-a-date"`) → verify it still deserializes (the time is stored as a raw string in `DatavalueValue.time`; no date validation happens at this layer).
-
-Use `#[cfg(test)]` module with `use super::*;` at the top.
+- `test_stream_mini_dump`: Open `tests/fixtures/mini_dump.json.gz` via `StreamReader`, drain the stream, verify:
+  - Total processed lines = 11 (8 entities + 2 delimiters + 1 malformed line? actually it depends on format — let the fixture define it)
+  - Filtered count = 5 (musician, band, singer, catch-all entity, all-4-props entity)
+  - Rejected count = 1 (malformed last line)
+  - Check specific filtered Q-IDs: `Q2831`, `Q11649`, `Q23215`, and the two catch-all entities
+  - Check inclusion reasons: musician → `"P106:Q639669"`, band → `"P31:Q215380"`, catch-all entity → starts with `"PROP:"`
+  - The `StreamEvent::Skipped` events for `[` and `]` delimiters are emitted but not counted in filtered/rejected totals
