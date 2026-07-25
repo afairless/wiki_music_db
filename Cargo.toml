@@ -38,3 +38,6 @@ thiserror = "2"
 # Utilities
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
