@@ -17,7 +17,7 @@ const CREATE_TABLE_STATEMENTS: &[&str] = &[
     // Core entity: person or group
     "CREATE TABLE IF NOT EXISTS artist (
         id              TEXT PRIMARY KEY,
-        name            TEXT NOT NULL,
+        name            TEXT,
         description     TEXT,
         artist_type     TEXT NOT NULL,
         inclusion_reason TEXT,
