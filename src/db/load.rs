@@ -42,13 +42,18 @@ pub fn load_all(conn: &Connection, parquet_dir: &Path) -> Result<()> {
     let artist_member_of = load_artist_member_of(conn, parquet_dir)?;
     tracing::info!(artist_member_of, "Loaded artist_member_of");
 
+    let (albums, tracks) = load_albums_and_tracks(conn, parquet_dir)?;
+    tracing::info!(albums, tracks, "Loaded albums and tracks");
+
     tracing::info!(
-        "Loading complete: {} genres, {} artists, {} artist_genre, {} artist_instrument, {} artist_member_of",
+        "Loading complete: {} genres, {} artists, {} artist_genre, {} artist_instrument, {} artist_member_of, {} albums, {} tracks",
         genres,
         artists,
         artist_genre,
         artist_instrument,
-        artist_member_of
+        artist_member_of,
+        albums,
+        tracks
     );
     Ok(())
 }
@@ -223,6 +228,95 @@ pub fn load_artist_member_of(conn: &Connection, parquet_dir: &Path) -> Result<us
         .context("Failed to count artist_member_of after load")?;
 
     Ok(count)
+}
+
+/// Load album and track stub entries from JSON array columns.
+///
+/// Parses the `albums` and `tracks` JSON VARCHAR columns from the artist
+/// Parquet files using DuckDB's `json_each` + `json_extract_string`. Creates
+/// stub entries in `album`, `album_artist`, `track`, and `track_artist` tables.
+///
+/// Album and track names use the Q-ID as a placeholder (a future phase can
+/// resolve actual names via a second pass over the dump or a SPARQL query).
+///
+/// Returns `(album_count, track_count)` — the total rows in each table after load.
+///
+/// # Errors
+///
+/// Returns an error if no Parquet files match the glob pattern, or if the
+/// SQL query fails.
+pub fn load_albums_and_tracks(conn: &Connection, parquet_dir: &Path) -> Result<(usize, usize)> {
+    let parquet_dir_str = parquet_dir
+        .to_str()
+        .context("Parquet directory path contains invalid UTF-8")?;
+
+    // Load album stubs
+    let album_sql = format!(
+        "INSERT OR IGNORE INTO album (id, name)
+         SELECT DISTINCT
+             json_extract_string(value, '$.album_id') as id,
+             json_extract_string(value, '$.album_id') as name
+         FROM read_parquet('{parquet_dir_str}/part-*.parquet'),
+         LATERAL json_each(albums)
+         WHERE albums IS NOT NULL AND albums != '[]'"
+    );
+
+    conn.execute(&album_sql, [])
+        .context("Failed to load albums from Parquet")?;
+
+    // Load album_artist join table
+    let album_artist_sql = format!(
+        "INSERT OR IGNORE INTO album_artist (album_id, artist_id, role)
+         SELECT
+             json_extract_string(value, '$.album_id') as album_id,
+             a.id as artist_id,
+             json_extract_string(value, '$.role') as role
+         FROM read_parquet('{parquet_dir_str}/part-*.parquet') a,
+         LATERAL json_each(a.albums)
+         WHERE a.albums IS NOT NULL AND a.albums != '[]'"
+    );
+
+    conn.execute(&album_artist_sql, [])
+        .context("Failed to load album_artist from Parquet")?;
+
+    // Load track stubs
+    let track_sql = format!(
+        "INSERT OR IGNORE INTO track (id, name)
+         SELECT DISTINCT
+             json_extract_string(value, '$.track_id') as id,
+             json_extract_string(value, '$.track_id') as name
+         FROM read_parquet('{parquet_dir_str}/part-*.parquet'),
+         LATERAL json_each(tracks)
+         WHERE tracks IS NOT NULL AND tracks != '[]'"
+    );
+
+    conn.execute(&track_sql, [])
+        .context("Failed to load tracks from Parquet")?;
+
+    // Load track_artist join table
+    let track_artist_sql = format!(
+        "INSERT OR IGNORE INTO track_artist (track_id, artist_id, role)
+         SELECT
+             json_extract_string(value, '$.track_id') as track_id,
+             a.id as artist_id,
+             json_extract_string(value, '$.role') as role
+         FROM read_parquet('{parquet_dir_str}/part-*.parquet') a,
+         LATERAL json_each(a.tracks)
+         WHERE a.tracks IS NOT NULL AND a.tracks != '[]'"
+    );
+
+    conn.execute(&track_artist_sql, [])
+        .context("Failed to load track_artist from Parquet")?;
+
+    let album_count: usize = conn
+        .query_row("SELECT COUNT(*) FROM album", [], |row| row.get(0))
+        .context("Failed to count albums after load")?;
+
+    let track_count: usize = conn
+        .query_row("SELECT COUNT(*) FROM track", [], |row| row.get(0))
+        .context("Failed to count tracks after load")?;
+
+    Ok((album_count, track_count))
 }
 
 #[cfg(test)]
@@ -684,5 +778,319 @@ mod tests {
             am_count2, am_count1,
             "artist_member_of count should not change"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // load_albums_and_tracks tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: write a Parquet file with album and track JSON data.
+    fn write_test_albums_tracks_parquet(dir: &Path) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("description", DataType::Utf8, true),
+            Field::new("artist_type", DataType::Utf8, false),
+            Field::new("inclusion_reason", DataType::Utf8, false),
+            Field::new("birth_date", DataType::Utf8, true),
+            Field::new("death_date", DataType::Utf8, true),
+            Field::new("genres", DataType::Utf8, false),
+            Field::new("instruments", DataType::Utf8, false),
+            Field::new("member_of", DataType::Utf8, false),
+            Field::new("albums", DataType::Utf8, false),
+            Field::new("tracks", DataType::Utf8, false),
+        ]));
+
+        let mut id_builder = StringBuilder::new();
+        let mut name_builder = StringBuilder::new();
+        let mut desc_builder = StringBuilder::new();
+        let mut type_builder = StringBuilder::new();
+        let mut reason_builder = StringBuilder::new();
+        let mut birth_builder = StringBuilder::new();
+        let mut death_builder = StringBuilder::new();
+        let mut genres_builder = StringBuilder::new();
+        let mut instruments_builder = StringBuilder::new();
+        let mut member_builder = StringBuilder::new();
+        let mut albums_builder = StringBuilder::new();
+        let mut tracks_builder = StringBuilder::new();
+
+        // Entity 1: has one album and one track
+        id_builder.append_value("Q2831");
+        name_builder.append_value("Ivy Queen");
+        desc_builder.append_value("American singer-songwriter");
+        type_builder.append_value("person");
+        reason_builder.append_value("P106:Q639669");
+        birth_builder.append_null();
+        death_builder.append_null();
+        genres_builder.append_value("");
+        instruments_builder.append_value("");
+        member_builder.append_value("");
+        albums_builder.append_value(r#"[{"album_id":"Q123","role":"performer"}]"#);
+        tracks_builder.append_value(r#"[{"track_id":"Q456","role":"performer"}]"#);
+
+        // Entity 2: references same album, empty tracks
+        id_builder.append_value("Q99999");
+        name_builder.append_null();
+        desc_builder.append_null();
+        type_builder.append_value("person");
+        reason_builder.append_value("PROP:P136");
+        birth_builder.append_null();
+        death_builder.append_null();
+        genres_builder.append_value("");
+        instruments_builder.append_value("");
+        member_builder.append_value("");
+        albums_builder.append_value(r#"[{"album_id":"Q123","role":"featured"}]"#);
+        tracks_builder.append_value("[]");
+
+        // Entity 3: empty albums and tracks
+        id_builder.append_value("Q12345");
+        name_builder.append_value("Test Artist");
+        desc_builder.append_null();
+        type_builder.append_value("group");
+        reason_builder.append_value("P31:Q215380");
+        birth_builder.append_null();
+        death_builder.append_null();
+        genres_builder.append_value("");
+        instruments_builder.append_value("");
+        member_builder.append_value("");
+        albums_builder.append_value("[]");
+        tracks_builder.append_value("[]");
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(id_builder.finish()),
+                Arc::new(name_builder.finish()),
+                Arc::new(desc_builder.finish()),
+                Arc::new(type_builder.finish()),
+                Arc::new(reason_builder.finish()),
+                Arc::new(birth_builder.finish()),
+                Arc::new(death_builder.finish()),
+                Arc::new(genres_builder.finish()),
+                Arc::new(instruments_builder.finish()),
+                Arc::new(member_builder.finish()),
+                Arc::new(albums_builder.finish()),
+                Arc::new(tracks_builder.finish()),
+            ],
+        )
+        .unwrap();
+
+        let path = dir.join("part-00001.parquet");
+        let file = fs::File::create(&path).unwrap();
+        let props = WriterProperties::builder().build();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    #[test]
+    fn test_load_albums() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_albums_tracks_parquet(dir.path());
+        let conn = test_conn();
+
+        load_artists(&conn, dir.path()).unwrap();
+        let (albums, _) = load_albums_and_tracks(&conn, dir.path()).unwrap();
+
+        // One distinct album Q123 referenced by two artists
+        assert_eq!(albums, 1, "Expected 1 album row");
+
+        // Verify album content
+        let album_name: String = conn
+            .query_row("SELECT name FROM album WHERE id = 'Q123'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(album_name, "Q123", "Album name should be Q-ID placeholder");
+
+        // Verify album_artist has 2 rows
+        let aa_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM album_artist", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(aa_count, 2, "Expected 2 album_artist rows");
+
+        // Verify roles
+        let roles: Vec<String> = conn
+            .prepare("SELECT role FROM album_artist WHERE album_id = 'Q123' ORDER BY role")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(roles, vec!["featured", "performer"]);
+    }
+
+    #[test]
+    fn test_load_albums_multiple_artists_same_album() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_albums_tracks_parquet(dir.path());
+        let conn = test_conn();
+
+        load_artists(&conn, dir.path()).unwrap();
+        let (albums, _) = load_albums_and_tracks(&conn, dir.path()).unwrap();
+
+        // Only one distinct album
+        assert_eq!(albums, 1, "Expected 1 album row from two references");
+
+        // Two album_artist entries
+        let aa_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM album_artist", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(aa_count, 2, "Expected 2 album_artist rows");
+    }
+
+    #[test]
+    fn test_load_albums_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write a Parquet file with only empty-album entity
+        let empty_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("description", DataType::Utf8, true),
+            Field::new("artist_type", DataType::Utf8, false),
+            Field::new("inclusion_reason", DataType::Utf8, false),
+            Field::new("birth_date", DataType::Utf8, true),
+            Field::new("death_date", DataType::Utf8, true),
+            Field::new("genres", DataType::Utf8, false),
+            Field::new("instruments", DataType::Utf8, false),
+            Field::new("member_of", DataType::Utf8, false),
+            Field::new("albums", DataType::Utf8, false),
+            Field::new("tracks", DataType::Utf8, false),
+        ]));
+
+        let mut b0 = StringBuilder::new();
+        b0.append_value("Q1");
+        let mut b1 = StringBuilder::new();
+        b1.append_null();
+        let mut b2 = StringBuilder::new();
+        b2.append_null();
+        let mut b3 = StringBuilder::new();
+        b3.append_value("person");
+        let mut b4 = StringBuilder::new();
+        b4.append_value("test");
+        let mut b5 = StringBuilder::new();
+        b5.append_null();
+        let mut b6 = StringBuilder::new();
+        b6.append_null();
+        let mut b7 = StringBuilder::new();
+        b7.append_value("");
+        let mut b8 = StringBuilder::new();
+        b8.append_value("");
+        let mut b9 = StringBuilder::new();
+        b9.append_value("");
+        let mut b10 = StringBuilder::new();
+        b10.append_value("[]");
+        let mut b11 = StringBuilder::new();
+        b11.append_value("[]");
+
+        let batch = RecordBatch::try_new(
+            empty_schema.clone(),
+            vec![
+                Arc::new(b0.finish()),
+                Arc::new(b1.finish()),
+                Arc::new(b2.finish()),
+                Arc::new(b3.finish()),
+                Arc::new(b4.finish()),
+                Arc::new(b5.finish()),
+                Arc::new(b6.finish()),
+                Arc::new(b7.finish()),
+                Arc::new(b8.finish()),
+                Arc::new(b9.finish()),
+                Arc::new(b10.finish()),
+                Arc::new(b11.finish()),
+            ],
+        )
+        .unwrap();
+
+        let path = dir.path().join("part-00001.parquet");
+        let file = fs::File::create(&path).unwrap();
+        let props = WriterProperties::builder().build();
+        let mut writer = ArrowWriter::try_new(file, empty_schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let conn = test_conn();
+        load_artists(&conn, dir.path()).unwrap();
+        let (albums, tracks) = load_albums_and_tracks(&conn, dir.path()).unwrap();
+        assert_eq!(albums, 0, "Expected 0 album rows from empty JSON");
+        assert_eq!(tracks, 0, "Expected 0 track rows from empty JSON");
+    }
+
+    #[test]
+    fn test_load_tracks() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_albums_tracks_parquet(dir.path());
+        let conn = test_conn();
+
+        load_artists(&conn, dir.path()).unwrap();
+        let (_, tracks) = load_albums_and_tracks(&conn, dir.path()).unwrap();
+
+        // One distinct track Q456
+        assert_eq!(tracks, 1, "Expected 1 track row");
+
+        // Verify track_artist
+        let ta_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM track_artist", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ta_count, 1, "Expected 1 track_artist row");
+
+        // Verify track name is Q-ID placeholder
+        let track_name: String = conn
+            .query_row("SELECT name FROM track WHERE id = 'Q456'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(track_name, "Q456");
+    }
+
+    #[test]
+    fn test_load_tracks_and_albums_together() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_albums_tracks_parquet(dir.path());
+        let conn = test_conn();
+
+        load_artists(&conn, dir.path()).unwrap();
+        let (albums, tracks) = load_albums_and_tracks(&conn, dir.path()).unwrap();
+
+        assert_eq!(albums, 1, "Expected 1 album");
+        assert_eq!(tracks, 1, "Expected 1 track");
+    }
+
+    #[test]
+    fn test_load_all_with_albums_and_tracks() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_genres_parquet(dir.path());
+        write_test_artists_parquet(dir.path());
+        write_test_albums_tracks_parquet(dir.path());
+        let conn = test_conn();
+
+        // Insert the group for FK satisfaction
+        conn.execute(
+            "INSERT OR IGNORE INTO artist (id, name, artist_type) VALUES ('Q11649', 'Test Group', 'group')",
+            [],
+        ).unwrap();
+
+        load_all(&conn, dir.path()).unwrap();
+
+        // Verify all tables have data
+        let artist_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist", [], |row| row.get(0))
+            .unwrap();
+        assert!(artist_count > 0, "Expected artists");
+
+        let genre_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM genre", [], |row| row.get(0))
+            .unwrap();
+        assert!(genre_count > 0, "Expected genres");
+
+        let album_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM album", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(album_count, 1, "Expected 1 album");
+
+        let track_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM track", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(track_count, 1, "Expected 1 track");
     }
 }
