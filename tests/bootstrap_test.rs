@@ -339,3 +339,80 @@ fn test_bootstrap_missing_dump_errors() {
         stderr
     );
 }
+
+// ---------------------------------------------------------------------------
+// Full-text search integration tests
+// ---------------------------------------------------------------------------
+
+/// Test that bootstrap populates data and FTS search (LIKE fallback) works
+/// for artist search after a full bootstrap.
+#[test]
+fn test_bootstrap_fts_search_artist() {
+    let dir = tempfile::TempDir::new().expect("create temp dir");
+    let fixture = create_fixture(dir.path());
+    let db_path = dir.path().join("music.duckdb");
+    let parquet_dir = dir.path().join("parquet");
+
+    let output = run_bootstrap(&fixture, &db_path, &parquet_dir, &[]);
+    assert_success(&output);
+
+    let conn = open_db(&db_path);
+
+    let results = wiki_db::db::query::search_artist(&conn, "Ivy Queen").unwrap();
+    assert_eq!(results.len(), 1, "Should find Ivy Queen");
+    assert_eq!(results[0].id, "Q2831");
+    assert_eq!(
+        results[0].name.as_deref(),
+        Some("Ivy Queen"),
+        "Artist name should match"
+    );
+    assert_eq!(
+        results[0].description.as_deref(),
+        Some("American singer-songwriter"),
+        "Artist description should match"
+    );
+}
+
+/// Test FTS search for a partial name match.
+#[test]
+fn test_bootstrap_fts_search_artist_partial() {
+    let dir = tempfile::TempDir::new().expect("create temp dir");
+    let fixture = create_fixture(dir.path());
+    let db_path = dir.path().join("music.duckdb");
+    let parquet_dir = dir.path().join("parquet");
+
+    let output = run_bootstrap(&fixture, &db_path, &parquet_dir, &[]);
+    assert_success(&output);
+
+    let conn = open_db(&db_path);
+
+    // Partial match via LIKE
+    let results = wiki_db::db::query::search_artist(&conn, "Ivy Qu").unwrap();
+    assert_eq!(results.len(), 1, "Should find Ivy Queen with partial name");
+    assert_eq!(results[0].id, "Q2831");
+
+    // Also search The Beatles
+    let beatles = wiki_db::db::query::search_artist(&conn, "Beatles").unwrap();
+    assert_eq!(beatles.len(), 1, "Should find The Beatles");
+    assert_eq!(beatles[0].id, "Q11649");
+}
+
+/// Test FTS search with a term that doesn't exist.
+#[test]
+fn test_bootstrap_fts_search_no_match() {
+    let dir = tempfile::TempDir::new().expect("create temp dir");
+    let fixture = create_fixture(dir.path());
+    let db_path = dir.path().join("music.duckdb");
+    let parquet_dir = dir.path().join("parquet");
+
+    let output = run_bootstrap(&fixture, &db_path, &parquet_dir, &[]);
+    assert_success(&output);
+
+    let conn = open_db(&db_path);
+
+    let results = wiki_db::db::query::search_artist(&conn, "NonexistentArtistXYZ").unwrap();
+    assert!(
+        results.is_empty(),
+        "Search for nonexistent term should return empty"
+    );
+}
