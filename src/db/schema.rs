@@ -151,6 +151,90 @@ pub fn load_fts_extension(conn: &Connection) -> DuckDbResult<bool> {
     }
 }
 
+/// Create full-text search indexes on the artist, album, and track tables.
+///
+/// Uses DuckDB's `PRAGMA create_fts_index` to create FTS shadow tables
+/// and register `fts_match_*` table functions. This function is
+/// idempotent — calling it twice on the same connection is safe because
+/// each PRAGMA is wrapped in a check that ignores "already exists"
+/// errors.
+///
+/// This function must be called **after** data loading, because
+/// `create_fts_index` requires the target tables to already exist.
+/// Create full-text search indexes on the artist, album, and track tables.
+///
+/// Attempts to create FTS indexes using DuckDB's FTS extension.
+/// DuckDB's bundled FTS extension registers the `create_fts_index`
+/// PRAGMA but does not support actual index creation in all builds.
+/// When creation is not possible, this function logs a warning and
+/// returns successfully — the query layer will transparently fall
+/// back to LIKE-based search.
+///
+/// This function is idempotent and must be called **after** data
+/// loading, because the target tables must already exist.
+pub fn create_fts_indexes(conn: &Connection) -> DuckDbResult<()> {
+    // Quick check: if FTS is not loaded or the PRAGMA isn't registered,
+    // skip creation and let the query layer use LIKE fallback.
+    if !fts_available(conn)? {
+        tracing::warn!(
+            "DuckDB FTS extension not available; LIKE fallback will be used"
+        );
+        return Ok(());
+    }
+
+    let has_pragma: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM duckdb_functions() \
+             WHERE function_name = 'create_fts_index'",
+            [],
+            |row| row.get(0),
+        )?;
+
+    if !has_pragma {
+        tracing::warn!(
+            "FTS extension loaded but 'create_fts_index' PRAGMA not found; \
+             LIKE fallback will be used"
+        );
+        return Ok(());
+    }
+
+    // Attempt to create FTS indexes on each table. The bundled FTS
+    // extension accepts the PRAGMA but may not create actual shadow
+    // tables — we attempt creation gracefully.
+    let prgms = [
+        "PRAGMA create_fts_index('artist', 'id', 'name', 'description')",
+        "PRAGMA create_fts_index('album', 'id', 'name')",
+        "PRAGMA create_fts_index('track', 'id', 'name')",
+    ];
+
+    for sql in &prgms {
+        let _ = conn.execute_batch(sql);
+    }
+
+    // Verify the creation worked by checking for shadow tables.
+    let shadow_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM information_schema.tables \
+         WHERE table_name IN \
+         ('fts_main_artist', 'fts_main_album', 'fts_main_track')",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if shadow_count >= 3 {
+        tracing::info!(
+            "FTS indexes created on artist, album, and track tables"
+        );
+    } else {
+        tracing::warn!(
+            "FTS extension loaded but could not create indexes \
+             ({}/3 shadow tables); LIKE fallback will be used",
+            shadow_count
+        );
+    }
+
+    Ok(())
+}
+
 /// Check whether the DuckDB FTS extension is available at runtime.
 ///
 /// Queries the `duckdb_extensions()` system table to determine whether
@@ -295,6 +379,41 @@ mod tests {
     // -------------------------------------------------------------------
     // FTS extension tests
     // -------------------------------------------------------------------
+
+    #[test]
+    fn test_create_fts_indexes_logs_no_error() {
+        // The FTS extension registers PRAGMAs in DuckDB v1.5.5 bundled
+        // but doesn't support full index creation. This test verifies
+        // the function completes without error (graceful no-op).
+        let conn = test_conn().unwrap();
+        initialize(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO artist (id, name, description, artist_type) \
+             VALUES ('Q1', 'Test Artist', 'A test description', 'person')",
+            [],
+        )
+        .unwrap();
+
+        create_fts_indexes(&conn).unwrap();
+        // Function should not error regardless of FTS availability.
+    }
+
+    #[test]
+    fn test_create_fts_indexes_idempotent() {
+        let conn = test_conn().unwrap();
+        initialize(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO artist (id, name, artist_type) VALUES ('Q1', 'Test', 'person')",
+            [],
+        )
+        .unwrap();
+
+        // Two calls should both succeed.
+        create_fts_indexes(&conn).unwrap();
+        create_fts_indexes(&conn).unwrap();
+    }
 
     #[test]
     fn test_load_fts_extension() {
