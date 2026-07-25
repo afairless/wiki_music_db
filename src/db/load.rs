@@ -33,7 +33,23 @@ pub fn load_all(conn: &Connection, parquet_dir: &Path) -> Result<()> {
     let artists = load_artists(conn, parquet_dir)?;
     tracing::info!(artists, "Loaded artists");
 
-    tracing::info!("Loading complete: {} genres, {} artists", genres, artists);
+    let artist_genre = load_artist_genre(conn, parquet_dir)?;
+    tracing::info!(artist_genre, "Loaded artist_genre");
+
+    let artist_instrument = load_artist_instrument(conn, parquet_dir)?;
+    tracing::info!(artist_instrument, "Loaded artist_instrument");
+
+    let artist_member_of = load_artist_member_of(conn, parquet_dir)?;
+    tracing::info!(artist_member_of, "Loaded artist_member_of");
+
+    tracing::info!(
+        "Loading complete: {} genres, {} artists, {} artist_genre, {} artist_instrument, {} artist_member_of",
+        genres,
+        artists,
+        artist_genre,
+        artist_instrument,
+        artist_member_of
+    );
     Ok(())
 }
 
@@ -102,6 +118,109 @@ pub fn load_artists(conn: &Connection, parquet_dir: &Path) -> Result<usize> {
     let count: usize = conn
         .query_row("SELECT COUNT(*) FROM artist", [], |row| row.get(0))
         .context("Failed to count artists after load")?;
+
+    Ok(count)
+}
+
+/// Load the `artist_genre` join table from the pipe-delimited `genres` column.
+///
+/// Parses the `genres` VARCHAR column from the artist Parquet files using
+/// DuckDB's `string_split` + `unnest`, and inserts into `artist_genre`.
+///
+/// Returns the total number of rows in the `artist_genre` table after load.
+///
+/// # Errors
+///
+/// Returns an error if no Parquet files match the glob pattern, or if the
+/// SQL query fails.
+pub fn load_artist_genre(conn: &Connection, parquet_dir: &Path) -> Result<usize> {
+    let parquet_dir_str = parquet_dir
+        .to_str()
+        .context("Parquet directory path contains invalid UTF-8")?;
+
+    let sql = format!(
+        "INSERT OR IGNORE INTO artist_genre (artist_id, genre_id)
+         SELECT a.id, unnest(string_split(a.genres, '|'))
+         FROM read_parquet('{parquet_dir_str}/part-*.parquet') a
+         WHERE a.genres IS NOT NULL AND a.genres != ''"
+    );
+
+    conn.execute(&sql, [])
+        .context("Failed to load artist_genre from Parquet")?;
+
+    let count: usize = conn
+        .query_row("SELECT COUNT(*) FROM artist_genre", [], |row| row.get(0))
+        .context("Failed to count artist_genre after load")?;
+
+    Ok(count)
+}
+
+/// Load the `artist_instrument` join table from the pipe-delimited `instruments` column.
+///
+/// Parses the `instruments` VARCHAR column from the artist Parquet files using
+/// DuckDB's `string_split` + `unnest`, and inserts into `artist_instrument`.
+///
+/// Returns the total number of rows in the `artist_instrument` table after load.
+///
+/// # Errors
+///
+/// Returns an error if no Parquet files match the glob pattern, or if the
+/// SQL query fails.
+pub fn load_artist_instrument(conn: &Connection, parquet_dir: &Path) -> Result<usize> {
+    let parquet_dir_str = parquet_dir
+        .to_str()
+        .context("Parquet directory path contains invalid UTF-8")?;
+
+    let sql = format!(
+        "INSERT OR IGNORE INTO artist_instrument (artist_id, instrument_id)
+         SELECT a.id, unnest(string_split(a.instruments, '|'))
+         FROM read_parquet('{parquet_dir_str}/part-*.parquet') a
+         WHERE a.instruments IS NOT NULL AND a.instruments != ''"
+    );
+
+    conn.execute(&sql, [])
+        .context("Failed to load artist_instrument from Parquet")?;
+
+    let count: usize = conn
+        .query_row("SELECT COUNT(*) FROM artist_instrument", [], |row| {
+            row.get(0)
+        })
+        .context("Failed to count artist_instrument after load")?;
+
+    Ok(count)
+}
+
+/// Load the `artist_member_of` join table from the pipe-delimited `member_of` column.
+///
+/// Parses the `member_of` VARCHAR column from the artist Parquet files using
+/// DuckDB's `string_split` + `unnest`, and inserts into `artist_member_of`.
+///
+/// Returns the total number of rows in the `artist_member_of` table after load.
+///
+/// # Errors
+///
+/// Returns an error if no Parquet files match the glob pattern, or if the
+/// SQL query fails.
+pub fn load_artist_member_of(conn: &Connection, parquet_dir: &Path) -> Result<usize> {
+    let parquet_dir_str = parquet_dir
+        .to_str()
+        .context("Parquet directory path contains invalid UTF-8")?;
+
+    let sql = format!(
+        "INSERT OR IGNORE INTO artist_member_of (artist_id, group_id)
+         SELECT a.id, unnest(string_split(a.member_of, '|'))
+         FROM read_parquet('{parquet_dir_str}/part-*.parquet') a
+         WHERE a.member_of IS NOT NULL AND a.member_of != ''"
+    );
+
+    conn.execute(&sql, [])
+        .context("Failed to load artist_member_of from Parquet")?;
+
+    let count: usize = conn
+        .query_row("SELECT COUNT(*) FROM artist_member_of", [], |row| {
+            row.get(0)
+        })
+        .context("Failed to count artist_member_of after load")?;
 
     Ok(count)
 }
@@ -186,7 +305,7 @@ mod tests {
         let mut albums_builder = StringBuilder::new();
         let mut tracks_builder = StringBuilder::new();
 
-        // Entity 1: Ivy Queen — full data
+        // Entity 1: Ivy Queen — full data with genres, instruments, member_of
         id_builder.append_value("Q2831");
         name_builder.append_value("Ivy Queen");
         desc_builder.append_value("American singer-songwriter");
@@ -195,12 +314,12 @@ mod tests {
         birth_builder.append_value("1972-03-22");
         death_builder.append_null();
         genres_builder.append_value("Q35718|Q57251");
-        instruments_builder.append_value("");
-        member_builder.append_value("");
+        instruments_builder.append_value("Q171|Q197");
+        member_builder.append_value("Q11649");
         albums_builder.append_value("[]");
         tracks_builder.append_value("[]");
 
-        // Entity 2: name is NULL
+        // Entity 2: empty pipe columns
         id_builder.append_value("Q99999");
         name_builder.append_null();
         desc_builder.append_null();
@@ -214,7 +333,7 @@ mod tests {
         albums_builder.append_value("[]");
         tracks_builder.append_value("[]");
 
-        // Entity 3: with date
+        // Entity 3: one genre Q57251, one instrument Q171, no member_of
         id_builder.append_value("Q12345");
         name_builder.append_value("Test Artist");
         desc_builder.append_null();
@@ -222,8 +341,8 @@ mod tests {
         reason_builder.append_value("P31:Q215380");
         birth_builder.append_null();
         death_builder.append_value("2000-01-15");
-        genres_builder.append_value("");
-        instruments_builder.append_value("");
+        genres_builder.append_value("Q57251");
+        instruments_builder.append_value("Q171");
         member_builder.append_value("");
         albums_builder.append_value("[]");
         tracks_builder.append_value("[]");
@@ -400,5 +519,170 @@ mod tests {
         // No genres.parquet exists — should error from load_genres
         let result = load_all(&conn, dir.path());
         assert!(result.is_err(), "Expected error for missing genres.parquet");
+    }
+
+    // -----------------------------------------------------------------------
+    // load_artist_genre tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_artist_genre() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_genres_parquet(dir.path());
+        write_test_artists_parquet(dir.path());
+        let conn = test_conn();
+
+        load_genres(&conn, dir.path()).unwrap();
+        load_artists(&conn, dir.path()).unwrap();
+
+        let count = load_artist_genre(&conn, dir.path()).unwrap();
+        // Q2831 has 2 genres (Q35718, Q57251), Q12345 has 1 (Q57251), Q99999 has 0 = 3 total
+        assert_eq!(count, 3, "Expected 3 artist_genre rows");
+
+        let jazz_artists: Vec<String> = conn
+            .prepare(
+                "SELECT a.name FROM artist a
+                 JOIN artist_genre ag ON a.id = ag.artist_id
+                 WHERE ag.genre_id = 'Q35718'
+                 ORDER BY a.name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(jazz_artists, vec!["Ivy Queen"]);
+    }
+
+    #[test]
+    fn test_load_artist_genre_no_genres() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_artists_parquet(dir.path());
+        let conn = test_conn();
+
+        load_artists(&conn, dir.path()).unwrap();
+        // Load genres to satisfy FK constraint
+        write_test_genres_parquet(dir.path());
+        load_genres(&conn, dir.path()).unwrap();
+        let count = load_artist_genre(&conn, dir.path()).unwrap();
+        // Q2831 has 2 genres, Q12345 has 1, Q99999 has 0 = 3 total
+        assert_eq!(count, 3, "Expected 3 artist_genre rows");
+    }
+
+    // -----------------------------------------------------------------------
+    // load_artist_instrument tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_artist_instrument() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_artists_parquet(dir.path());
+        let conn = test_conn();
+
+        load_artists(&conn, dir.path()).unwrap();
+        let count = load_artist_instrument(&conn, dir.path()).unwrap();
+        // Q2831 has 2 instruments (Q171, Q197), Q12345 has 1 (Q171), Q99999 has 0 = 3
+        assert_eq!(count, 3, "Expected 3 artist_instrument rows");
+    }
+
+    #[test]
+    fn test_load_artist_instrument_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_artists_parquet(dir.path());
+        let conn = test_conn();
+
+        load_artists(&conn, dir.path()).unwrap();
+        let count = load_artist_instrument(&conn, dir.path()).unwrap();
+        assert!(count > 0, "Expected some artist_instrument rows");
+    }
+
+    // -----------------------------------------------------------------------
+    // load_artist_member_of tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_artist_member_of() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_artists_parquet(dir.path());
+        let conn = test_conn();
+
+        load_artists(&conn, dir.path()).unwrap();
+        // Insert the group referenced by member_of to satisfy FK
+        conn.execute(
+            "INSERT OR IGNORE INTO artist (id, name, artist_type) VALUES ('Q11649', 'Test Group', 'group')",
+            []
+        ).unwrap();
+        let count = load_artist_member_of(&conn, dir.path()).unwrap();
+        // Q2831 has 1 member_of (Q11649), others have 0 = 1 total
+        assert_eq!(count, 1, "Expected 1 artist_member_of row");
+    }
+
+    // -----------------------------------------------------------------------
+    // load_all join table idempotency test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_all_join_tables_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_genres_parquet(dir.path());
+        write_test_artists_parquet(dir.path());
+        let conn = test_conn();
+
+        // Insert the group referenced by member_of to satisfy FK
+        conn.execute(
+            "INSERT OR IGNORE INTO artist (id, name, artist_type) VALUES ('Q11649', 'Test Group', 'group')",
+            []
+        ).unwrap();
+
+        load_all(&conn, dir.path()).unwrap();
+
+        let ag_count1: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_genre", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ag_count1, 3, "Expected 3 artist_genre after first load");
+
+        let ai_count1: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_instrument", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            ai_count1, 3,
+            "Expected 3 artist_instrument after first load"
+        );
+
+        let am_count1: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_member_of", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(am_count1, 1, "Expected 1 artist_member_of after first load");
+
+        load_all(&conn, dir.path()).unwrap();
+
+        let ag_count2: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_genre", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ag_count2, ag_count1, "artist_genre count should not change");
+
+        let ai_count2: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_instrument", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            ai_count2, ai_count1,
+            "artist_instrument count should not change"
+        );
+
+        let am_count2: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_member_of", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            am_count2, am_count1,
+            "artist_member_of count should not change"
+        );
     }
 }
