@@ -4,10 +4,15 @@
 //! returned by the Wikidata API and the JSON dump format. Only the fields
 //! needed for music-relevant filtering are captured; qualifiers and
 //! references are ignored entirely for v1.
+//!
+//! The `Mainsnak` type uses a custom `Deserialize` implementation to
+//! handle the three `snaktype` variants (`value`, `novalue`, `somevalue`).
 
 use std::collections::HashMap;
 
+use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// A top-level Wikidata entity.
 ///
@@ -84,48 +89,262 @@ pub struct Claim {
 
 /// A mainsnak object within a claim.
 ///
-/// Uses serde-derive for now. Step 3 will replace this with a custom
-/// `Deserialize` implementation that handles the three `snaktype`
-/// variants (`value`, `novalue`, `somevalue`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Uses a custom `Deserialize` implementation to handle the three
+/// `snaktype` variants:
+///
+/// - `"value"` — the `datavalue` field is parsed and the nested `value`
+///   object is extracted into `DatavalueValue`.
+/// - `"novalue"` — no value exists; `datavalue` is `None`.
+/// - `"somevalue"` — unknown value; `datavalue` is `None`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Mainsnak {
     /// The snak type: `"value"`, `"novalue"`, or `"somevalue"`.
     pub snaktype: String,
 
-    /// The optional data value. `None` for `novalue` and `somevalue`.
-    pub datavalue: Option<Datavalue>,
+    /// The extracted value. `None` for `novalue` and `somevalue`.
+    pub datavalue: Option<DatavalueValue>,
 }
 
-/// A typed data value inside a mainsnak.
-///
-/// The `datavalue_type` field records the type of value (e.g.
-/// `"wikibase-entityid"`, `"time"`, `"string"`), and `value` holds
-/// the raw JSON payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Datavalue {
-    /// The type discriminator (e.g. `"wikibase-entityid"`, `"time"`).
-    #[serde(rename = "type")]
-    pub datavalue_type: String,
-
-    /// The raw value payload. Contains the nested object from which
-    /// `id` and `time` are extracted in the custom deserializer.
-    pub value: serde_json::Value,
-}
-
-/// Pre-defined value extraction type (used by the Step 3 custom deserializer).
+/// The extracted value from a mainsnak's datavalue.
 ///
 /// Only `id` (for Q-ID references) and `time` (for dates) are captured.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EntityValue {
+/// All other fields in the nested value object are silently ignored.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct DatavalueValue {
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
     pub time: Option<String>,
 }
 
+// --- Custom Serialize + Deserialize for Mainsnak ---
+
+impl Serialize for Mainsnak {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("snaktype", &self.snaktype)?;
+
+        if let Some(ref dv) = self.datavalue {
+            // Build the datavalue object: { "value": { "id": ..., "time": ... } }
+            let inner = serde_json::json!(dv);
+            let datavalue_obj = serde_json::json!({"value": inner});
+            map.serialize_entry("datavalue", &datavalue_obj)?;
+        }
+
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Mainsnak {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(MainsnakVisitor)
+    }
+}
+
+struct MainsnakVisitor;
+
+impl<'de> Visitor<'de> for MainsnakVisitor {
+    type Value = Mainsnak;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a Wikidata mainsnak object")
+    }
+
+    fn visit_map<V>(self, mut map: V) -> Result<Self::Value, V::Error>
+    where
+        V: MapAccess<'de>,
+    {
+        let mut snaktype: Option<String> = None;
+        let mut datavalue_raw: Option<serde_json::Value> = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "snaktype" => {
+                    snaktype = Some(map.next_value()?);
+                }
+                "datavalue" => {
+                    datavalue_raw = map.next_value::<Option<serde_json::Value>>()?;
+                }
+                // Silently ignore all other fields (id, rank, qualifiers, references, hash, etc.)
+                _ => {
+                    map.next_value::<serde_json::Value>()?;
+                }
+            }
+        }
+
+        let snaktype = snaktype.unwrap_or_default();
+
+        let datavalue = if snaktype == "value" {
+            match datavalue_raw {
+                Some(val) => {
+                    // Extract the nested "value" object and try to parse it as DatavalueValue
+                    let inner = val.get("value");
+                    match inner {
+                        Some(v) => serde_json::from_value(v.clone()).ok(),
+                        None => None,
+                    }
+                }
+                None => None,
+            }
+        } else {
+            // "novalue" or "somevalue" — datavalue is always None
+            None
+        };
+
+        Ok(Mainsnak {
+            snaktype,
+            datavalue,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Custom deserializer tests (Step 3) ---
+
+    /// Value snaktype with entity ID.
+    #[test]
+    fn test_value_snaktype_with_entity_id() {
+        let json = r#"{
+            "snaktype": "value",
+            "datavalue": {
+                "value": { "id": "Q639669" }
+            }
+        }"#;
+        let ms: Mainsnak = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(ms.snaktype, "value");
+        assert_eq!(
+            ms.datavalue,
+            Some(DatavalueValue {
+                id: Some("Q639669".into()),
+                time: None
+            })
+        );
+    }
+
+    /// Value snaktype with time.
+    #[test]
+    fn test_value_snaktype_with_time() {
+        let json = r#"{
+            "snaktype": "value",
+            "datavalue": {
+                "value": { "time": "+1926-09-23T00:00:00Z" }
+            }
+        }"#;
+        let ms: Mainsnak = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(ms.snaktype, "value");
+        assert_eq!(
+            ms.datavalue,
+            Some(DatavalueValue {
+                id: None,
+                time: Some("+1926-09-23T00:00:00Z".into())
+            })
+        );
+    }
+
+    /// Novalue snaktype.
+    #[test]
+    fn test_novalue_snaktype() {
+        let json = r#"{
+            "snaktype": "novalue"
+        }"#;
+        let ms: Mainsnak = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(ms.snaktype, "novalue");
+        assert_eq!(ms.datavalue, None);
+    }
+
+    /// Somevalue snaktype.
+    #[test]
+    fn test_somevalue_snaktype() {
+        let json = r#"{
+            "snaktype": "somevalue"
+        }"#;
+        let ms: Mainsnak = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(ms.snaktype, "somevalue");
+        assert_eq!(ms.datavalue, None);
+    }
+
+    /// Full claim with ignored fields (id, rank, qualifiers, references).
+    #[test]
+    fn test_full_claim_with_ignored_fields() {
+        let json = r#"{
+            "id": "Q2831$B1C2D3E4-F5A6-7890-ABCD-EF1234567890",
+            "mainsnak": {
+                "snaktype": "value",
+                "datavalue": {
+                    "value": { "id": "Q639669" }
+                }
+            },
+            "rank": "normal",
+            "qualifiers": {
+                "P580": []
+            },
+            "references": [
+                { "P143": [] }
+            ],
+            "hash": "abc123def456"
+        }"#;
+        let claim: Claim = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(claim.mainsnak.snaktype, "value");
+        assert_eq!(
+            claim.mainsnak.datavalue,
+            Some(DatavalueValue {
+                id: Some("Q639669".into()),
+                time: None
+            })
+        );
+        // Extra fields should be captured in the catch-all
+        assert!(claim.extra.contains_key("id"));
+        assert!(claim.extra.contains_key("rank"));
+        assert!(claim.extra.contains_key("qualifiers"));
+        assert!(claim.extra.contains_key("references"));
+        assert!(claim.extra.contains_key("hash"));
+    }
+
+    /// Entity with P106 claim.
+    #[test]
+    fn test_entity_with_p106_claim() {
+        let json = r#"{
+            "id": "Q2831",
+            "type": "item",
+            "labels": { "en": { "value": "Ivy Queen" } },
+            "descriptions": { "en": { "value": "American singer-songwriter and musician" } },
+            "claims": {
+                "P106": [
+                    {
+                        "mainsnak": {
+                            "snaktype": "value",
+                            "datavalue": {
+                                "value": { "id": "Q639669" }
+                            }
+                        }
+                    }
+                ]
+            }
+        }"#;
+        let entity: Entity = serde_json::from_str(json).expect("deserialize");
+        let p106 = entity.claims.get("P106").expect("P106 claim");
+        assert_eq!(p106.len(), 1);
+        assert_eq!(
+            p106[0].mainsnak.datavalue,
+            Some(DatavalueValue {
+                id: Some("Q639669".into()),
+                time: None
+            })
+        );
+    }
+
+    // --- Model tests (Step 2) ---
 
     /// Round-trip: serialize a known `Entity` to JSON, deserialize back,
     /// and verify fields match.
@@ -161,11 +380,9 @@ mod tests {
                     vec![Claim {
                         mainsnak: Mainsnak {
                             snaktype: "value".into(),
-                            datavalue: Some(Datavalue {
-                                datavalue_type: "wikibase-entityid".into(),
-                                value: serde_json::json!({
-                                    "id": "Q639669"
-                                }),
+                            datavalue: Some(DatavalueValue {
+                                id: Some("Q639669".into()),
+                                time: None,
                             }),
                         },
                         extra: HashMap::new(),
