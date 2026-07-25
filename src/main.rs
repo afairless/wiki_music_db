@@ -230,6 +230,17 @@ fn cmd_bootstrap(args: &cli::bootstrap::BootstrapArgs) -> Result<()> {
     pb.set_message("DuckDB loading complete");
     pb.tick();
 
+    // --- Create FTS indexes ---
+    pb.set_message("Creating FTS indexes...");
+    pb.tick();
+
+    if let Err(e) = schema::create_fts_indexes(&conn) {
+        tracing::warn!(error = %e, "Failed to create FTS indexes; LIKE fallback will be used");
+    }
+
+    pb.set_message("FTS indexes ready");
+    pb.tick();
+
     // --- Cleanup Parquet files ---
     if args.cleanup_parquet {
         tracing::info!(
@@ -259,6 +270,8 @@ fn cmd_bootstrap(args: &cli::bootstrap::BootstrapArgs) -> Result<()> {
         .query_row("SELECT COUNT(*) FROM track", [], |row| row.get(0))
         .context("Failed to count tracks")?;
 
+    let fts_enabled = schema::fts_available(&conn).unwrap_or(false);
+
     pb.finish_with_message("Bootstrap complete");
 
     tracing::info!(
@@ -266,6 +279,7 @@ fn cmd_bootstrap(args: &cli::bootstrap::BootstrapArgs) -> Result<()> {
         genres = genre_count,
         albums = album_count,
         tracks = track_count,
+        fts = fts_enabled,
         "Bootstrap summary"
     );
 
@@ -275,6 +289,12 @@ fn cmd_bootstrap(args: &cli::bootstrap::BootstrapArgs) -> Result<()> {
     println!("  Genres:  {}", genre_count);
     println!("  Albums:  {}", album_count);
     println!("  Tracks:  {}", track_count);
+
+    if fts_enabled {
+        println!("  FTS:      enabled (DuckDB fts extension)");
+    } else {
+        println!("  FTS:      disabled (using LIKE fallback)");
+    }
 
     if args.cleanup_parquet {
         println!("  Parquet files: deleted");
