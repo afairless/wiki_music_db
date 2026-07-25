@@ -79,7 +79,8 @@ pub struct LanguageValue {
 /// via `#[serde(flatten)]` and silently ignored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Claim {
-    pub mainsnak: Mainsnak,
+    #[serde(default)]
+    pub mainsnak: Option<Mainsnak>,
 
     /// Catch-all for extra fields we don't explicitly model.
     #[serde(flatten)]
@@ -295,9 +296,9 @@ mod tests {
             "hash": "abc123def456"
         }"#;
         let claim: Claim = serde_json::from_str(json).expect("deserialize");
-        assert_eq!(claim.mainsnak.snaktype, "value");
+        assert_eq!(claim.mainsnak.as_ref().unwrap().snaktype, "value");
         assert_eq!(
-            claim.mainsnak.datavalue,
+            claim.mainsnak.as_ref().unwrap().datavalue,
             Some(DatavalueValue {
                 id: Some("Q639669".into()),
                 time: None
@@ -336,7 +337,7 @@ mod tests {
         let p106 = entity.claims.get("P106").expect("P106 claim");
         assert_eq!(p106.len(), 1);
         assert_eq!(
-            p106[0].mainsnak.datavalue,
+            p106[0].mainsnak.as_ref().unwrap().datavalue,
             Some(DatavalueValue {
                 id: Some("Q639669".into()),
                 time: None
@@ -378,13 +379,13 @@ mod tests {
                 claims.insert(
                     "P106".into(),
                     vec![Claim {
-                        mainsnak: Mainsnak {
+                        mainsnak: Some(Mainsnak {
                             snaktype: "value".into(),
                             datavalue: Some(DatavalueValue {
                                 id: Some("Q639669".into()),
                                 time: None,
                             }),
-                        },
+                        }),
                         extra: HashMap::new(),
                     }],
                 );
@@ -408,7 +409,7 @@ mod tests {
         assert_eq!(deserialized.claims.len(), 1);
         let p106 = &deserialized.claims["P106"];
         assert_eq!(p106.len(), 1);
-        assert_eq!(p106[0].mainsnak.snaktype, "value");
+        assert_eq!(p106[0].mainsnak.as_ref().unwrap().snaktype, "value");
     }
 
     /// Empty claims: deserialize an entity with no `claims` field — verify
@@ -512,5 +513,136 @@ mod tests {
             m
         });
         assert_eq!(descriptions.en(), Some("English Description"));
+    }
+
+    // --- Fixture-based deserialization tests (Step 5) ---
+
+    /// Load musician fixture: verify entity identifiers and labels.
+    #[test]
+    fn test_load_musician_fixture() {
+        let json = include_str!("../../tests/fixtures/musician_entity.json");
+        let entity: Entity = serde_json::from_str(json).expect("deserialize musician");
+        assert_eq!(entity.id, "Q2831");
+        assert_eq!(entity.entity_type, "item");
+        assert_eq!(
+            entity.labels.as_ref().and_then(|l| l.en()),
+            Some("Ivy Queen")
+        );
+        assert_eq!(
+            entity.descriptions.as_ref().and_then(|d| d.en()),
+            Some("American singer-songwriter and musician")
+        );
+    }
+
+    /// Load band fixture: verify Q-ID, label, and P31 claim.
+    #[test]
+    fn test_load_band_fixture() {
+        let json = include_str!("../../tests/fixtures/band_entity.json");
+        let entity: Entity = serde_json::from_str(json).expect("deserialize band");
+        assert_eq!(entity.id, "Q11649");
+        assert_eq!(
+            entity.labels.as_ref().and_then(|l| l.en()),
+            Some("The Beatles")
+        );
+        let p31 = entity.claims.get("P31").expect("P31 claim");
+        assert_eq!(p31.len(), 1);
+        assert_eq!(
+            p31[0].mainsnak.as_ref().unwrap().datavalue,
+            Some(DatavalueValue {
+                id: Some("Q215380".into()),
+                time: None
+            })
+        );
+    }
+
+    /// Load non-musician fixture: verify no music-related properties.
+    #[test]
+    fn test_load_non_musician_fixture() {
+        let json = include_str!("../../tests/fixtures/non_musician_entity.json");
+        let entity: Entity = serde_json::from_str(json).expect("deserialize non-musician");
+        assert_eq!(entity.id, "Q42");
+        let music_properties = ["P106", "P1303", "P175", "P136", "P358"];
+        for prop in &music_properties {
+            assert!(
+                !entity.claims.contains_key(*prop),
+                "Entity should not have claim {}",
+                prop
+            );
+        }
+    }
+
+    /// Malformed JSON line: truncated JSON should return an error.
+    #[test]
+    fn test_malformed_json_returns_error() {
+        let json = include_str!("../../tests/fixtures/malformed_entity.json");
+        let result: Result<Entity, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "malformed JSON should fail to deserialize");
+    }
+
+    /// Entity missing `labels.en`: labels present but no "en" key → en() returns None.
+    #[test]
+    fn test_labels_en_none_when_missing_from_entity() {
+        let json = r#"{
+            "id": "Q99",
+            "type": "item",
+            "labels": { "de": { "value": "Nur Deutsch" } },
+            "claims": {}
+        }"#;
+        let entity: Entity = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(entity.labels.as_ref().and_then(|l| l.en()), None);
+    }
+
+    /// Entity where P106 claim has no mainsnak: deserialization should succeed
+    /// with a fallback/default mainsnak.
+    #[test]
+    fn test_claim_without_mainsnak() {
+        let json = r#"{
+            "id": "Q99",
+            "type": "item",
+            "claims": {
+                "P106": [
+                    {
+                        "id": "some-claim-id"
+                    }
+                ]
+            }
+        }"#;
+        let entity: Entity = serde_json::from_str(json).expect("deserialize");
+        let p106 = entity.claims.get("P106").expect("P106 claim");
+        assert!(!p106.is_empty(), "P106 should have an entry");
+        // The claim should have a default mainsnak (empty snaktype string)
+        assert!(p106[0].mainsnak.is_none());
+    }
+
+    /// Date value that is invalid: the time is stored as a raw string;
+    /// no date validation happens at this layer.
+    #[test]
+    fn test_invalid_date_still_deserializes() {
+        let json = r#"{
+            "id": "Q99",
+            "type": "item",
+            "claims": {
+                "P569": [
+                    {
+                        "mainsnak": {
+                            "snaktype": "value",
+                            "datavalue": {
+                                "value": { "time": "not-a-date" }
+                            }
+                        }
+                    }
+                ]
+            }
+        }"#;
+        let entity: Entity = serde_json::from_str(json).expect("deserialize");
+        let p569 = entity.claims.get("P569").expect("P569 claim");
+        assert_eq!(p569.len(), 1);
+        assert_eq!(
+            p569[0].mainsnak.as_ref().unwrap().datavalue,
+            Some(DatavalueValue {
+                id: None,
+                time: Some("not-a-date".into())
+            })
+        );
     }
 }
