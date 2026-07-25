@@ -1,0 +1,52 @@
+{
+  "id": "Q11649",
+  "type": "item",
+  "labels": {
+    "en": {
+      "value": "The Beatles"
+    }
+  },
+  "descriptions": {
+    "en": {
+      "value": "English rock band"
+    }
+  },
+  "claims": {
+    "P31": [
+      {
+        "mainsnak": {
+          "snaktype": "value",
+          "datavalue": {
+            "value": {
+              "id": "Q215380"
+            }
+          }
+        }
+      }
+    ],
+    "P136": [
+      {
+        "mainsnak": {
+          "snaktype": "value",
+          "datavalue": {
+            "value": {
+              "id": "Q57251"
+            }
+          }
+        }
+      }
+    ],
+    "P571": [
+      {
+        "mainsnak": {
+          "snaktype": "value",
+          "datavalue": {
+            "value": {
+              "time": "+1960-01-01T00:00:00Z"
+            }
+          }
+        }
+      }
+    ]
+  }
+}

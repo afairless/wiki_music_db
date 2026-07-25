@@ -1,0 +1,28 @@
+{
+  "id": "Q42",
+  "type": "item",
+  "labels": {
+    "en": {
+      "value": "Douglas Adams"
+    }
+  },
+  "descriptions": {
+    "en": {
+      "value": "English author and humorist"
+    }
+  },
+  "claims": {
+    "P31": [
+      {
+        "mainsnak": {
+          "snaktype": "value",
+          "datavalue": {
+            "value": {
+              "id": "Q5"
+            }
+          }
+        }
+      }
+    ]
+  }
+}

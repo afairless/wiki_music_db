@@ -1,0 +1,64 @@
+{
+  "id": "Q2831",
+  "type": "item",
+  "labels": {
+    "en": {
+      "value": "Ivy Queen"
+    }
+  },
+  "descriptions": {
+    "en": {
+      "value": "American singer-songwriter and musician"
+    }
+  },
+  "claims": {
+    "P106": [
+      {
+        "mainsnak": {
+          "snaktype": "value",
+          "datavalue": {
+            "value": {
+              "id": "Q639669"
+            }
+          }
+        }
+      }
+    ],
+    "P31": [
+      {
+        "mainsnak": {
+          "snaktype": "value",
+          "datavalue": {
+            "value": {
+              "id": "Q5"
+            }
+          }
+        }
+      }
+    ],
+    "P136": [
+      {
+        "mainsnak": {
+          "snaktype": "value",
+          "datavalue": {
+            "value": {
+              "id": "Q35718"
+            }
+          }
+        }
+      }
+    ],
+    "P569": [
+      {
+        "mainsnak": {
+          "snaktype": "value",
+          "datavalue": {
+            "value": {
+              "time": "+1972-03-22T00:00:00Z"
+            }
+          }
+        }
+      }
+    ]
+  }
+}
