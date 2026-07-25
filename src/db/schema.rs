@@ -100,9 +100,9 @@ const CREATE_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_genre_name ON genre(name)",
 ];
 
-/// Initialize the database: create all tables, indexes, and seed
-/// the schema version. This function is idempotent — safe to call
-/// on every startup.
+/// Initialize the database: create all tables, indexes, seed
+/// the schema version, and attempt to load the FTS extension.
+/// This function is idempotent — safe to call on every startup.
 pub fn initialize(conn: &Connection) -> DuckDbResult<()> {
     // Create all tables. Foreign-key enforcement is enabled by
     // default in DuckDB 1.x, so no explicit PRAGMA is needed.
@@ -121,7 +121,47 @@ pub fn initialize(conn: &Connection) -> DuckDbResult<()> {
         duckdb::params![SCHEMA_VERSION],
     )?;
 
+    // Attempt to load the FTS extension (failure is non-fatal;
+    // queries will fall back to LIKE patterns).
+    let _ = load_fts_extension(conn)?;
+
     Ok(())
+}
+
+/// Attempt to load the DuckDB FTS extension.
+///
+/// Returns `true` if the extension was successfully loaded, `false` if
+/// it is unavailable (in which case LIKE fallbacks will be used).
+///
+/// This function is idempotent — calling it multiple times is safe.
+/// Failures are logged as warnings and do not propagate.
+pub fn load_fts_extension(conn: &Connection) -> DuckDbResult<bool> {
+    match conn.execute_batch("INSTALL fts; LOAD fts;") {
+        Ok(()) => {
+            tracing::info!("DuckDB FTS extension loaded successfully");
+            Ok(true)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "FTS extension unavailable, falling back to LIKE queries"
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// Check whether the DuckDB FTS extension is available at runtime.
+///
+/// Queries the `duckdb_extensions()` system table to determine whether
+/// the FTS extension has been loaded into the current session.
+pub fn fts_available(conn: &Connection) -> DuckDbResult<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM duckdb_extensions() WHERE extension_name = 'fts' AND loaded = true",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 /// Check whether all expected tables exist in the database.
@@ -250,6 +290,46 @@ mod tests {
     fn test_indexes_exist_empty_db() {
         let conn = test_conn().unwrap();
         assert!(!all_indexes_exist(&conn).unwrap());
+    }
+
+    // -------------------------------------------------------------------
+    // FTS extension tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_load_fts_extension() {
+        let conn = test_conn().unwrap();
+        let result = load_fts_extension(&conn).unwrap();
+        assert!(result, "Expected FTS extension to load");
+    }
+
+    #[test]
+    fn test_load_fts_extension_idempotent() {
+        let conn = test_conn().unwrap();
+        let first = load_fts_extension(&conn).unwrap();
+        let second = load_fts_extension(&conn).unwrap();
+        assert!(first, "First load should succeed");
+        assert!(second, "Second load should also succeed (idempotent)");
+    }
+
+    #[test]
+    fn test_fts_available_after_load() {
+        let conn = test_conn().unwrap();
+        initialize(&conn).unwrap();
+        assert!(
+            fts_available(&conn).unwrap(),
+            "FTS should be available after initialize()"
+        );
+    }
+
+    #[test]
+    fn test_fts_available_before_load() {
+        let conn = test_conn().unwrap();
+        // On a fresh connection without FTS loaded, fts_available is false.
+        assert!(
+            !fts_available(&conn).unwrap(),
+            "FTS should not be available on a fresh connection"
+        );
     }
 
     #[test]
