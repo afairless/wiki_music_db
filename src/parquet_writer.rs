@@ -16,10 +16,57 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
-use crate::extraction::MusicEntity;
+use crate::extraction::{GenreEntry, MusicEntity};
 
 /// Default number of entities per Parquet file before rotating.
 const DEFAULT_BATCH_SIZE: usize = 100_000;
+
+/// Write genre entries to a `genres.parquet` file.
+///
+/// The Parquet schema is `(id: VARCHAR, name: VARCHAR)` with both columns
+/// non-nullable. This file is read by `load_genres` during the DuckDB loading phase.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be created or the Parquet write fails.
+pub fn write_genres_parquet(genres: &[GenreEntry], path: &Path) -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+
+    let mut id_builder = StringBuilder::new();
+    let mut name_builder = StringBuilder::new();
+
+    for genre in genres {
+        id_builder.append_value(&genre.id);
+        name_builder.append_value(&genre.name);
+    }
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_builder.finish()),
+            Arc::new(name_builder.finish()),
+        ],
+    )
+    .context("Failed to create genre RecordBatch")?;
+
+    let file = fs::File::create(path)
+        .with_context(|| format!("Failed to create genre parquet file: {}", path.display()))?;
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+        .context("Failed to create ArrowWriter for genres")?;
+
+    writer
+        .write(&batch)
+        .context("Failed to write genre RecordBatch to Parquet")?;
+    writer
+        .close()
+        .context("Failed to close genre ArrowWriter")?;
+
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Batch writer
@@ -415,6 +462,49 @@ mod tests {
             vec![Some("1972-03-22".into())]
         );
         assert_eq!(col_to_strings(&batches[0], 6), vec![None::<String>]);
+    }
+
+    // -----------------------------------------------------------------------
+    // write_genres_parquet tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_write_genres_parquet() {
+        let dir = tempfile::tempdir().unwrap();
+        let genres = vec![
+            GenreEntry {
+                id: "Q35718".into(),
+                name: "jazz".into(),
+            },
+            GenreEntry {
+                id: "Q57251".into(),
+                name: "rock music".into(),
+            },
+        ];
+        let path = dir.path().join("genres.parquet");
+        write_genres_parquet(&genres, &path).unwrap();
+
+        // Read back and verify
+        let batches = read_parquet(&path).unwrap();
+        assert_eq!(batches[0].num_rows(), 2);
+        let ids = col_to_strings(&batches[0], 0);
+        let names = col_to_strings(&batches[0], 1);
+        assert_eq!(ids, vec![Some("Q35718".into()), Some("Q57251".into()),]);
+        assert_eq!(names, vec![Some("jazz".into()), Some("rock music".into()),]);
+    }
+
+    #[test]
+    fn test_write_genres_parquet_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let genres: Vec<GenreEntry> = vec![];
+        let path = dir.path().join("genres.parquet");
+        write_genres_parquet(&genres, &path).unwrap();
+
+        let batches = read_parquet(&path).unwrap();
+        // Empty parquet with 0 rows may produce 0 batches
+        if !batches.is_empty() {
+            assert_eq!(batches[0].num_rows(), 0);
+        }
     }
 
     #[test]
