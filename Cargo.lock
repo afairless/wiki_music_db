@@ -821,6 +821,7 @@ checksum = "970e05eedd3f55c435194d9104f90a9b4a79a80d6e73251bc9ff43e178130c4e"
 dependencies = [
  "arrow 58.4.0",
  "cast",
+ "chrono",
  "comfy-table",
  "fallible-iterator",
  "fallible-streaming-iterator",

@@ -235,14 +235,51 @@ pub fn create_fts_indexes(conn: &Connection) -> DuckDbResult<()> {
     Ok(())
 }
 
-/// Check whether the DuckDB FTS extension is available at runtime.
+/// Check whether the DuckDB FTS extension is available and usable.
 ///
-/// Queries the `duckdb_extensions()` system table to determine whether
-/// the FTS extension has been loaded into the current session.
+/// First queries `duckdb_extensions()` to verify the FTS extension is
+/// loaded. Then checks whether any `fts_main_*` table functions exist
+/// (which indicates that FTS indexes have been successfully created).
+/// Both conditions must be true for FTS to be usable.
 pub fn fts_available(conn: &Connection) -> DuckDbResult<bool> {
+    // Check that the FTS extension is loaded.
+    let loaded: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM duckdb_extensions() \
+             WHERE extension_name = 'fts' AND loaded = true",
+            [],
+            |row| row.get(0),
+        )?;
+
+    if !loaded {
+        return Ok(false);
+    }
+
+    // Check that FTS table functions exist (indexes were created).
+    // This handles the case where the FTS extension is loaded but
+    // cannot actually create indexes (common in bundled builds).
+    let has_functions: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM duckdb_functions() \
+             WHERE function_name LIKE 'fts\\_main\\_%' ESCAPE '\\' \
+             AND function_type = 'table'",
+            [],
+            |row| row.get(0),
+        )?;
+
+    Ok(has_functions)
+}
+
+/// Check whether an FTS index exists for a specific table.
+///
+/// Queries `information_schema.tables` for the corresponding FTS shadow
+/// table (`fts_main_<table_name>`). Returns `true` if the shadow table
+/// exists, indicating that the FTS index was successfully created.
+pub fn fts_index_exists(conn: &Connection, table: &str) -> DuckDbResult<bool> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM duckdb_extensions() WHERE extension_name = 'fts' AND loaded = true",
-        [],
+        "SELECT COUNT(*) FROM information_schema.tables \
+         WHERE table_name = ?1",
+        duckdb::params![format!("fts_main_{}", table)],
         |row| row.get(0),
     )?;
     Ok(count > 0)
@@ -432,12 +469,16 @@ mod tests {
     }
 
     #[test]
-    fn test_fts_available_after_load() {
+    fn test_fts_available_after_initialize() {
         let conn = test_conn().unwrap();
         initialize(&conn).unwrap();
+        // FTS extension is loaded during initialize(), but FTS table
+        // functions only exist after successful index creation. In
+        // bundled DuckDB builds, indexes cannot be created, so
+        // fts_available() returns false.
         assert!(
-            fts_available(&conn).unwrap(),
-            "FTS should be available after initialize()"
+            !fts_available(&conn).unwrap(),
+            "FTS should not be available after initialize() without index creation"
         );
     }
 
