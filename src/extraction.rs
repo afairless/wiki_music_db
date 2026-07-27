@@ -332,7 +332,7 @@ pub fn extract_genre_labels(
         source: e,
         path: dump_path.to_path_buf(),
     })?;
-    let decoder = flate2::read::GzDecoder::new(file);
+    let decoder = flate2::read::MultiGzDecoder::new(file);
     let mut reader = std::io::BufReader::new(decoder);
 
     let mut genres: Vec<GenreEntry> = Vec::new();

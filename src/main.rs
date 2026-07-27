@@ -7,6 +7,7 @@ use duckdb::Connection;
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing_subscriber::EnvFilter;
 use wiki_db::cli::{self, Cli, Command};
+use wiki_db::config::Config;
 use wiki_db::db::load::load_all;
 use wiki_db::db::schema;
 use wiki_db::extraction::{extract_genre_labels, extract_music_entity};
@@ -15,36 +16,163 @@ use wiki_db::wikidata::stream::StreamEvent;
 use wiki_db::wikidata::stream::StreamReader;
 
 fn main() -> Result<()> {
-    // Initialize structured logging with sensible defaults.
-    // Use RUST_LOG env var to control verbosity (e.g., RUST_LOG=debug).
+    // Parse CLI args first so we can read the --config flag.
+    let cli = Cli::parse();
+
+    // Initialize structured logging: RUST_LOG env var > "info"
+    // NOTE: logging is initialized BEFORE config loading so that config load
+    // errors are visible (tracing::warn! needs an active subscriber).
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
-    let cli = Cli::parse();
+    // Load optional config file.  Silently falls back if the file doesn't exist.
+    let config = match Config::load(&cli.config) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            // Config file exists but is malformed -- warn and continue with CLI defaults.
+            tracing::warn!(error = %e, "Failed to load config file; using CLI defaults");
+            None
+        }
+    };
+
+    // Override log level from config if set (but only if RUST_LOG is not set,
+    // since env var takes precedence per the EnvFilter semantics).
+    if let Some(level) = config.as_ref().and_then(|c| c.log_level.as_deref())
+        && std::env::var("RUST_LOG").is_err() {
+            tracing::info!("Using log level from config: {}", level);
+        }
+
+    if let Some(_cfg) = &config {
+        tracing::debug!("Loaded config file: {}", cli.config.display());
+    }
 
     match &cli.command {
-        Command::Bootstrap(args) => cmd_bootstrap(args),
-        Command::Update(args) => cmd_update(args),
-        Command::Query(args) => cmd_query(args),
+        Command::Download(args) => cmd_download(args, config.as_ref()),
+        Command::Bootstrap(args) => cmd_bootstrap(args, config.as_ref()),
+        Command::Update(args) => cmd_update(args, config.as_ref()),
+        Command::Query(args) => cmd_query(args, config.as_ref()),
     }
 }
 
+/// Execute the `download` subcommand.
+///
+/// Delegates to `scripts/download_dump.sh`, passing along the configured or
+/// default output path and any user-supplied flags.
+fn cmd_download(args: &cli::download::DownloadArgs, config: Option<&Config>) -> Result<()> {
+    let script_path = find_download_script()?;
+
+    // Resolve output path: CLI flag > config `dump` field > default
+    let output = args
+        .output
+        .clone()
+        .or_else(|| config.and_then(|c| c.dump_path()))
+        .unwrap_or_else(|| "latest-all.json.gz".to_string());
+
+    tracing::info!(
+        "Starting Wikidata dump download via {}",
+        script_path.display()
+    );
+    tracing::info!("Output path: {}", output);
+
+    let mut cmd = std::process::Command::new(&script_path);
+    cmd.arg("--output").arg(&output);
+
+    if args.force {
+        cmd.arg("--force");
+    }
+    if args.quiet {
+        cmd.arg("--quiet");
+    }
+
+    let status = cmd.status().with_context(|| {
+        format!(
+            "Failed to execute download script: {}",
+            script_path.display()
+        )
+    })?;
+
+    if status.success() {
+        tracing::info!("Download complete: {}", output);
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Download script exited with code {}; see output above for details.",
+            status.code().unwrap_or(-1)
+        );
+    }
+}
+
+/// Find `scripts/download_dump.sh` relative to the binary or CWD.
+fn find_download_script() -> Result<std::path::PathBuf> {
+    // Check next to the binary (`cargo install` case)
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+    if let Some(ref dir) = exe_dir {
+        let candidate = dir.join("download_dump.sh");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        // Check ../scripts/ relative to binary (debug/release build dirs)
+        let candidate = dir.join("scripts").join("download_dump.sh");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    // Fallback: assume CWD is the project root
+    let candidate = std::path::Path::new("scripts/download_dump.sh");
+    if candidate.exists() {
+        return Ok(candidate.to_path_buf());
+    }
+    anyhow::bail!(
+        "Could not find scripts/download_dump.sh. Run this command from the project root, or install the script alongside the binary."
+    );
+}
+
 /// Execute the `bootstrap` subcommand.
-fn cmd_bootstrap(args: &cli::bootstrap::BootstrapArgs) -> Result<()> {
-    let dump_path = Path::new(&args.dump);
-    let db_path = Path::new(&args.db);
-    let parquet_dir = Path::new(&args.parquet_dir);
+fn cmd_bootstrap(args: &cli::bootstrap::BootstrapArgs, config: Option<&Config>) -> Result<()> {
+    // Resolve paths: CLI flag > config file > hardcoded default
+    let dump_str = args
+        .dump
+        .clone()
+        .or_else(|| config.and_then(|c| c.dump_path()))
+        .context("No dump path specified. Use --dump <PATH> or set `dump` in wiki_db.toml.")?;
+
+    let db_str = args
+        .db
+        .clone()
+        .or_else(|| config.and_then(|c| c.db_path()))
+        .unwrap_or_else(|| "music.duckdb".to_string());
+
+    let parquet_dir_str = args
+        .parquet_dir
+        .clone()
+        .or_else(|| config.and_then(|c| c.parquet_dir_path()))
+        .unwrap_or_else(|| "parquet-dir".to_string());
+
+    // Boolean flags: CLI true wins, else check config, else default false
+    let cleanup = args.cleanup_parquet
+        || config.and_then(|c| c.cleanup_parquet).unwrap_or(false);
+    let resume = args.resume
+        || config.and_then(|c| c.resume).unwrap_or(false);
+
+    let dump_path = Path::new(&dump_str);
+    let db_path = Path::new(&db_str);
+    let parquet_dir = Path::new(&parquet_dir_str);
 
     if !dump_path.exists() {
-        anyhow::bail!("Dump file not found: {}", dump_path.display());
+        anyhow::bail!(
+            "Dump file not found: {}. Use --dump <PATH> or set `dump` in wiki_db.toml.",
+            dump_path.display()
+        );
     }
 
     // --- Resume support: check existing Parquet files ---
     let mut skip_streaming = false;
-    if args.resume && parquet_dir.exists() {
+    if resume && parquet_dir.exists() {
         let entries = find_parquet_files(parquet_dir);
         if !entries.is_empty() {
             // Find the highest part-* file index
@@ -242,7 +370,7 @@ fn cmd_bootstrap(args: &cli::bootstrap::BootstrapArgs) -> Result<()> {
     pb.tick();
 
     // --- Cleanup Parquet files ---
-    if args.cleanup_parquet {
+    if cleanup {
         tracing::info!(
             "Cleaning up intermediate Parquet files: {}",
             parquet_dir.display()
@@ -296,7 +424,7 @@ fn cmd_bootstrap(args: &cli::bootstrap::BootstrapArgs) -> Result<()> {
         println!("  FTS:      disabled (using LIKE fallback)");
     }
 
-    if args.cleanup_parquet {
+    if cleanup {
         println!("  Parquet files: deleted");
     } else {
         println!("  Parquet files: {}", parquet_dir.display());
@@ -326,13 +454,13 @@ fn find_parquet_files(dir: &Path) -> Vec<std::path::PathBuf> {
 }
 
 /// Execute the `update` subcommand.
-fn cmd_update(_args: &cli::update::UpdateArgs) -> Result<()> {
+fn cmd_update(_args: &cli::update::UpdateArgs, _config: Option<&Config>) -> Result<()> {
     tracing::info!("update command not yet implemented");
     Ok(())
 }
 
 /// Execute the `query` subcommand.
-fn cmd_query(args: &cli::query::QueryArgs) -> Result<()> {
+fn cmd_query(args: &cli::query::QueryArgs, _config: Option<&Config>) -> Result<()> {
     use cli::query::QueryCommand;
     match &args.command {
         QueryCommand::Artist(a) => {
@@ -436,7 +564,7 @@ mod tests {
     /// Helper: run cmd_bootstrap and verify it succeeds.
     fn run_bootstrap(dump: &Path, db: &Path, parquet_dir: &Path) {
         let args = setup_bootstrap_args(dump, db, parquet_dir);
-        let result = cmd_bootstrap(&args);
+        let result = cmd_bootstrap(&args, None);
         assert!(
             result.is_ok(),
             "cmd_bootstrap failed: {}",
@@ -459,7 +587,7 @@ mod tests {
         let args =
             BootstrapArgs::try_parse_from(["bootstrap", "--dump", "/tmp/test.json.gz"]).unwrap();
         // Just verify the command function runs without error.
-        let result = cmd_bootstrap(&args);
+        let result = cmd_bootstrap(&args, None);
         assert!(result.is_err()); // No such file
     }
 
@@ -499,7 +627,7 @@ mod tests {
         let args =
             BootstrapArgs::try_parse_from(["bootstrap", "--dump", "/nonexistent/file.json.gz"])
                 .unwrap();
-        let result = cmd_bootstrap(&args);
+        let result = cmd_bootstrap(&args, None);
         assert!(result.is_err(), "Expected error for missing dump file");
     }
 
@@ -522,7 +650,7 @@ mod tests {
         ])
         .unwrap();
 
-        let result = cmd_bootstrap(&args);
+        let result = cmd_bootstrap(&args, None);
         assert!(
             result.is_ok(),
             "cmd_bootstrap failed: {}",
@@ -568,7 +696,7 @@ mod tests {
     fn test_update_cmd_logs() {
         use wiki_db::cli::update::UpdateArgs;
         let args = UpdateArgs::try_parse_from(["update"]).unwrap();
-        let result = cmd_update(&args);
+        let result = cmd_update(&args, None);
         assert!(result.is_ok());
     }
 
@@ -576,7 +704,7 @@ mod tests {
     fn test_query_artist_cmd_logs() {
         use wiki_db::cli::query::QueryArgs;
         let args = QueryArgs::try_parse_from(["query", "artist", "--name", "Test"]).unwrap();
-        let result = cmd_query(&args);
+        let result = cmd_query(&args, None);
         assert!(result.is_ok());
     }
 
@@ -584,7 +712,7 @@ mod tests {
     fn test_query_genre_cmd_logs() {
         use wiki_db::cli::query::QueryArgs;
         let args = QueryArgs::try_parse_from(["query", "genre", "--name", "Test"]).unwrap();
-        let result = cmd_query(&args);
+        let result = cmd_query(&args, None);
         assert!(result.is_ok());
     }
 
@@ -592,7 +720,7 @@ mod tests {
     fn test_query_album_cmd_logs() {
         use wiki_db::cli::query::QueryArgs;
         let args = QueryArgs::try_parse_from(["query", "album", "--name", "Test"]).unwrap();
-        let result = cmd_query(&args);
+        let result = cmd_query(&args, None);
         assert!(result.is_ok());
     }
 
@@ -600,7 +728,7 @@ mod tests {
     fn test_query_search_cmd_logs() {
         use wiki_db::cli::query::QueryArgs;
         let args = QueryArgs::try_parse_from(["query", "search", "--term", "Test"]).unwrap();
-        let result = cmd_query(&args);
+        let result = cmd_query(&args, None);
         assert!(result.is_ok());
     }
 }

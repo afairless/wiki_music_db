@@ -29,25 +29,144 @@ cd wiki_db
 cargo build --release
 ```
 
-### Usage
+### Pipeline
 
-**1. Download the Wikidata dump** (~35 GB, resumable):
+> **Note**: Running a full bootstrap takes 30-60 minutes and requires ~50 GB of
+> free disk space.  The next two commands are all you need for a complete build.
+
+**Step 1 — Download** the Wikidata dump (resumable, ~35 GB):
 
 ```bash
-./scripts/download_dump.sh --output latest-all.json.gz
+cargo run -- download
 ```
 
-**2. Bootstrap the database** (30-60 minutes on a modern CPU):
+**Step 2 — Import** into DuckDB (takes 30-60 minutes on a modern CPU):
 
 ```bash
+cargo run --release -- bootstrap
+```
+
+That's it.  By default the dump lands as `latest-all.json.gz` in the current
+directory, the DuckDB database is created as `music.duckdb`, and intermediate
+Parquet files are kept under `parquet-dir/`.  All of these paths can be
+customised through `wiki_db.toml` (see below).
+
+Customising paths via CLI flags is also supported:
+
+```bash
+cargo run -- download --output /data/dump.json.gz
+cargo run --release -- bootstrap --dump /data/dump.json.gz --db /data/music.duckdb
+```
+
+---
+
+## Configuration
+
+Set all your defaults in a single `wiki_db.toml` file so you don't need to
+repeat CLI flags.  Place it in the project root and run the two commands above
+as-is — they'll pick up the configured paths automatically.
+
+```toml
+# =============================================================================
+# wiki_db.toml — every field is optional; CLI flags override these values
+# =============================================================================
+
+# ---------- Download & bootstrap paths --------------------------------------
+
+dump = "~/wiki_db/latest-all.json.gz"       # download and bootstrap both use this
+# db = "~/wiki_db/music.duckdb"              # bootstrap output (default: music.duckdb)
+# parquet_dir = "~/wiki_db/parquet-dir"      # intermediate files (default: parquet-dir)
+
+# ---------- Behaviour flags -------------------------------------------------
+
+# cleanup_parquet = true                     # delete Parquet files after load
+# resume = false                             # skip completed Parquet on re-run
+
+# ---------- Logging ---------------------------------------------------------
+
+# log_level = "info"                         # trace | debug | info | warn | error
+```
+
+> **Path expansion**: Leading `~/` in any path is automatically expanded to your
+> home directory.  Relative paths are resolved from the working directory.
+
+### Precedence
+
+```
+CLI flag > Config file > Hardcoded default
+```
+
+Every tool can be driven entirely by CLI flags — the config file is never
+required.  When both exist, CLI flags win.
+
+If the config file doesn't exist, the tool silently continues.  If it exists
+but contains invalid TOML, a warning is logged and CLI defaults are used — the
+tool never refuses to run over a bad config.
+
+### Custom config path
+
+Use `--config` to point to a different file:
+
+```bash
+cargo run -- --config /etc/wiki_db/production.toml bootstrap
+```
+
+By default the tool looks for `wiki_db.toml` in the current directory.
+
+### Full config reference
+
+| Field | Type | Default | CLI override | Used by |
+|---|---|---|---|---|
+| `dump` | string | — | `--dump` / `--output` | `download`, `bootstrap` |
+| `db` | string | `music.duckdb` | `--db` | `bootstrap` |
+| `parquet_dir` | string | `parquet-dir` | `--parquet-dir` | `bootstrap` |
+| `cleanup_parquet` | bool | `false` | `--cleanup-parquet` | `bootstrap` |
+| `resume` | bool | `false` | `--resume` | `bootstrap` |
+| `log_level` | string | `info` | `RUST_LOG` env var | all |
+
+---
+
+## Pipeline: Download → Import
+
+### Step 1 — Download the Wikidata dump
+
+```bash
+cargo run -- download
+```
+
+This calls `scripts/download_dump.sh` using the configured `dump` path (or
+`latest-all.json.gz` by default).  The download script supports:
+
+- **Automatic resume** — interrupted transfers continue where they left off
+  (HTTP range requests via `curl -C -`)
+- **MD5 verification** — checksum checked automatically after download
+- **Gzip integrity check** — validates the archive before reporting success
+- **Signal safety** — `Ctrl-C` leaves the partial file in place for resume
+
+```bash
+cargo run -- download --help
+```
+
+### Step 2 — Bootstrap the database
+
+```bash
+cargo run --release -- bootstrap
+```
+
+The bootstrap subcommand reads `dump`, `db`, `parquet_dir`, `cleanup_parquet`,
+and `resume` from the config file if they aren't given as CLI flags.
+
+```bash
+# Override paths for a one-off build
 cargo run --release -- bootstrap \
-    --dump latest-all.json.gz \
-    --db music.duckdb \
-    --parquet-dir parquet-dir \
-    --cleanup-parquet
+    --dump /tmp/dump.json.gz \
+    --db /tmp/experiment.duckdb
+
+# Resume an interrupted run
+cargo run --release -- bootstrap --resume
 ```
 
-**3. Query the database** (not yet fully implemented):
+### Step 3 — Query the database
 
 ```bash
 cargo run --release -- query artist --name "Miles Davis"
@@ -55,28 +174,46 @@ cargo run --release -- query genre --name "Jazz"
 cargo run --release -- query album --name "Kind of Blue"
 ```
 
-### Command Reference
+> **Note**: The `query` and `update` subcommands currently log "not yet implemented"
+> and exit.  Only `download` and `bootstrap` are functional.
 
-#### `bootstrap` — Build the database from a Wikidata dump
+---
+
+## Command Reference
+
+### `download` — Download the Wikidata dump
 
 ```
-cargo run -- bootstrap --dump <PATH> [OPTIONS]
+cargo run -- download [OPTIONS]
 
 Options:
-  --dump <PATH>          Path to the Wikidata JSON dump (gzipped, required)
+  --output <PATH>   Target file path (default: from wiki_db.toml `dump`, or latest-all.json.gz)
+  --force           Re-download even if a complete valid dump exists
+  --quiet           Suppress progress output
+  --config <PATH>   TOML config file (default: wiki_db.toml)
+```
+
+### `bootstrap` — Build the database from a Wikidata dump
+
+```
+cargo run -- bootstrap [OPTIONS]
+
+Options:
+  --dump <PATH>          Path to the Wikidata JSON dump (from wiki_db.toml or required)
   --db <PATH>            Path to the output DuckDB database (default: music.duckdb)
   --parquet-dir <PATH>   Directory for intermediate Parquet files (default: parquet-dir)
   --cleanup-parquet      Delete intermediate Parquet files after successful load
   --resume               Skip already-written Parquet files to resume interrupted run
+  --config <PATH>        TOML config file (default: wiki_db.toml)
 ```
 
-#### `update` — Incrementally update the database (not yet implemented)
+### `update` — Incrementally update the database (not yet implemented)
 
 ```
 cargo run -- update [--since <TIMESTAMP>] [--dry-run]
 ```
 
-#### `query` — Search the database
+### `query` — Search the database
 
 ```
 cargo run -- query artist   --name <NAME>
@@ -85,7 +222,8 @@ cargo run -- query album    --name <NAME>
 cargo run -- query search   --term <TERM>
 ```
 
-> **Note**: The `query` and `update` subcommands currently log "not yet implemented" and exit. Only `bootstrap` is functional.
+> **Note**: The `query` and `update` subcommands currently log "not yet implemented"
+> and exit. Only `download` and `bootstrap` are functional.
 
 ## Database Schema
 

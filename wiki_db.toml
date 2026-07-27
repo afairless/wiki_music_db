@@ -1,0 +1,61 @@
+# =============================================================================
+# wiki_db — configuration
+# =============================================================================
+#
+# This file provides defaults for all wiki_db commands. CLI flags always
+# take precedence over values in this file.
+#
+# Run `cargo run -- --help` for the full CLI reference.
+# =============================================================================
+
+# ---------- Bootstrap defaults ----------------------------------------------
+
+## Path to the Wikidata JSON dump (gzipped).
+## Override with: bootstrap --dump <PATH>
+dump = "~/wiki_db/latest-all.json.gz"
+
+## Path to the output DuckDB database file.
+## Override with: bootstrap --db <PATH>
+db = "~/wiki_db/music.duckdb"
+
+## Directory for intermediate Parquet files.
+## Override with: bootstrap --parquet-dir <PATH>
+parquet_dir = "~/wiki_db/parquet-dir"
+
+## Delete intermediate Parquet files after successful load.
+## Override with: bootstrap --cleanup-parquet
+# cleanup_parquet = false
+
+## Skip already-written Parquet files to resume an interrupted run.
+## Override with: bootstrap --resume
+# resume = false
+
+# ---------- Logging ----------------------------------------------------------
+
+## Logging level: trace | debug | info | warn | error
+## Override with: RUST_LOG env var
+# log_level = "info"
+
+# ---------- Download settings (for the download_dump.sh reference) -----------
+
+[download]
+## URL of the Wikidata entity dump.
+# url = "https://dumps.wikimedia.org/wikidatawiki/entities/latest-all.json.gz"
+
+## Default output path for the downloaded dump.
+# output = "latest-all.json.gz"
+
+## User-Agent for HTTP requests.
+user_agent = "wiki_db/0.1.0 (wiki-tally-project; mailto:lmanmcel@gmail.com)"
+
+## Suppress progress output.
+# quiet = false
+
+# ---------- Update defaults (for the `update` subcommand) --------------------
+
+[update]
+## Sync timestamp override (ISO 8601).
+# since = ""
+
+## Print changes without writing.
+# dry_run = false

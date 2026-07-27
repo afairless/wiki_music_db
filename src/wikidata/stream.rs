@@ -8,9 +8,9 @@ use std::io::BufRead;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 
-use crate::wikidata::filter::{FilterResult, is_music_entity};
+use crate::wikidata::filter::{is_music_entity, FilterResult};
 use crate::wikidata::model::Entity;
 
 // ---------------------------------------------------------------------------
@@ -48,7 +48,7 @@ pub enum StreamEvent {
 /// commas are removed, and the line is deserialised as an [`Entity`]. If the
 /// entity passes the music filter, a [`StreamEvent::Filtered`] is yielded.
 pub struct StreamReader {
-    reader: std::io::BufReader<GzDecoder<std::fs::File>>,
+    reader: std::io::BufReader<MultiGzDecoder<std::fs::File>>,
     line_buf: String,
     line_number: u64,
     /// Accumulated counters: (processed_lines, filtered_entities, rejected_lines).
@@ -68,7 +68,7 @@ impl StreamReader {
     pub fn new(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path)
             .with_context(|| format!("Failed to open dump file: {}", path.display()))?;
-        let decoder = GzDecoder::new(file);
+        let decoder = MultiGzDecoder::new(file);
         let reader = std::io::BufReader::new(decoder);
 
         Ok(StreamReader {
