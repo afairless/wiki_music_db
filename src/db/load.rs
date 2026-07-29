@@ -143,11 +143,18 @@ pub fn load_artist_genre(conn: &Connection, parquet_dir: &Path) -> Result<usize>
         .to_str()
         .context("Parquet directory path contains invalid UTF-8")?;
 
+    // Wrap in a subquery to filter out genre IDs that don't exist in the
+    // genre table. Some genre Q-IDs referenced in P136 claims may not have
+    // English labels, so they were skipped during genre label extraction and
+    // have no corresponding row in the genre table.
     let sql = format!(
         "INSERT OR IGNORE INTO artist_genre (artist_id, genre_id)
-         SELECT a.id, unnest(string_split(a.genres, '|'))
-         FROM read_parquet('{parquet_dir_str}/part-*.parquet') a
-         WHERE a.genres IS NOT NULL AND a.genres != ''"
+         SELECT id, genre_qid FROM (
+             SELECT a.id, unnest(string_split(a.genres, '|')) as genre_qid
+             FROM read_parquet('{parquet_dir_str}/part-*.parquet') a
+             WHERE a.genres IS NOT NULL AND a.genres != ''
+         ) sq
+         WHERE sq.genre_qid IN (SELECT id FROM genre)"
     );
 
     conn.execute(&sql, [])
@@ -211,11 +218,17 @@ pub fn load_artist_member_of(conn: &Connection, parquet_dir: &Path) -> Result<us
         .to_str()
         .context("Parquet directory path contains invalid UTF-8")?;
 
+    // Wrap in a subquery to filter out group IDs that don't exist in the
+    // artist table. Groups referenced in P463 claims may not have passed the
+    // music entity filter themselves, so they have no corresponding row.
     let sql = format!(
         "INSERT OR IGNORE INTO artist_member_of (artist_id, group_id)
-         SELECT a.id, unnest(string_split(a.member_of, '|'))
-         FROM read_parquet('{parquet_dir_str}/part-*.parquet') a
-         WHERE a.member_of IS NOT NULL AND a.member_of != ''"
+         SELECT id, member_qid FROM (
+             SELECT a.id, unnest(string_split(a.member_of, '|')) as member_qid
+             FROM read_parquet('{parquet_dir_str}/part-*.parquet') a
+             WHERE a.member_of IS NOT NULL AND a.member_of != ''
+         ) sq
+         WHERE sq.member_qid IN (SELECT id FROM artist)"
     );
 
     conn.execute(&sql, [])
