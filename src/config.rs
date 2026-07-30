@@ -16,11 +16,12 @@ use serde::Deserialize;
 /// Returns the original string if `~` cannot be expanded.
 pub fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME") {
-            let mut expanded = std::path::PathBuf::from(home);
-            expanded.push(rest);
-            return expanded.to_string_lossy().into_owned();
-        }
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        let mut expanded = std::path::PathBuf::from(home);
+        expanded.push(rest);
+        return expanded.to_string_lossy().into_owned();
+    }
     path.to_owned()
 }
 

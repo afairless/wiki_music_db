@@ -43,9 +43,10 @@ fn main() -> Result<()> {
     // Override log level from config if set (but only if RUST_LOG is not set,
     // since env var takes precedence per the EnvFilter semantics).
     if let Some(level) = config.as_ref().and_then(|c| c.log_level.as_deref())
-        && std::env::var("RUST_LOG").is_err() {
-            tracing::info!("Using log level from config: {}", level);
-        }
+        && std::env::var("RUST_LOG").is_err()
+    {
+        tracing::info!("Using log level from config: {}", level);
+    }
 
     if let Some(_cfg) = &config {
         tracing::debug!("Loaded config file: {}", cli.config.display());
@@ -156,10 +157,8 @@ fn cmd_bootstrap(args: &cli::bootstrap::BootstrapArgs, config: Option<&Config>) 
         .unwrap_or_else(|| "parquet-dir".to_string());
 
     // Boolean flags: CLI true wins, else check config, else default false
-    let cleanup = args.cleanup_parquet
-        || config.and_then(|c| c.cleanup_parquet).unwrap_or(false);
-    let resume = args.resume
-        || config.and_then(|c| c.resume).unwrap_or(false);
+    let cleanup = args.cleanup_parquet || config.and_then(|c| c.cleanup_parquet).unwrap_or(false);
+    let resume = args.resume || config.and_then(|c| c.resume).unwrap_or(false);
 
     let dump_path = Path::new(&dump_str);
     let db_path = Path::new(&db_str);
@@ -482,7 +481,11 @@ fn cmd_query(args: &cli::query::QueryArgs, config: Option<&Config>) -> Result<()
                 .with_context(|| format!("Failed to search artist: {}", a.name))?;
 
             if results.is_empty() {
-                println!("{}: No artists found matching '{}'", "No Results".bold().yellow(), a.name);
+                println!(
+                    "{}: No artists found matching '{}'",
+                    "No Results".bold().yellow(),
+                    a.name
+                );
                 return Ok(());
             }
 
@@ -510,7 +513,9 @@ fn cmd_query(args: &cli::query::QueryArgs, config: Option<&Config>) -> Result<()
                         println!("{}  {}", "Genres:".yellow(), names.join(", "));
                     }
                     Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e, artist_id = %artist.id, "Failed to fetch genres"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, artist_id = %artist.id, "Failed to fetch genres")
+                    }
                 }
 
                 match query::artist_albums(&conn, &artist.id) {
@@ -528,13 +533,17 @@ fn cmd_query(args: &cli::query::QueryArgs, config: Option<&Config>) -> Result<()
                         }
                     }
                     Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e, artist_id = %artist.id, "Failed to fetch albums"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, artist_id = %artist.id, "Failed to fetch albums")
+                    }
                 }
 
                 match query::artist_instruments(&conn, &artist.id) {
                     Ok(instruments) if !instruments.is_empty() => {
-                        let ids: Vec<&str> =
-                            instruments.iter().map(|i| i.instrument_id.as_str()).collect();
+                        let ids: Vec<&str> = instruments
+                            .iter()
+                            .map(|i| i.instrument_id.as_str())
+                            .collect();
                         println!("{}  {}", "Instruments:".yellow(), ids.join(", "));
                     }
                     Ok(_) => {}
@@ -549,7 +558,11 @@ fn cmd_query(args: &cli::query::QueryArgs, config: Option<&Config>) -> Result<()
                 .with_context(|| format!("Failed to search genre: {}", g.name))?;
 
             if results.is_empty() {
-                println!("{}: No genres found matching '{}'", "No Results".bold().yellow(), g.name);
+                println!(
+                    "{}: No genres found matching '{}'",
+                    "No Results".bold().yellow(),
+                    g.name
+                );
                 return Ok(());
             }
 
@@ -563,10 +576,7 @@ fn cmd_query(args: &cli::query::QueryArgs, config: Option<&Config>) -> Result<()
                     Ok(artists) if !artists.is_empty() => {
                         println!("{}  {} artists", "Artists:".yellow(), artists.len());
                         for artist in &artists {
-                            let name = artist
-                                .name
-                                .as_deref()
-                                .unwrap_or("(unknown)");
+                            let name = artist.name.as_deref().unwrap_or("(unknown)");
                             println!("    - {} ({})", name, artist.artist_type);
                         }
                         println!("      (use --limit/--offset to paginate)");
@@ -583,7 +593,11 @@ fn cmd_query(args: &cli::query::QueryArgs, config: Option<&Config>) -> Result<()
                 .with_context(|| format!("Failed to search album: {}", a.name))?;
 
             if results.is_empty() {
-                println!("{}: No albums found matching '{}'", "No Results".bold().yellow(), a.name);
+                println!(
+                    "{}: No albums found matching '{}'",
+                    "No Results".bold().yellow(),
+                    a.name
+                );
                 return Ok(());
             }
 
@@ -600,10 +614,7 @@ fn cmd_query(args: &cli::query::QueryArgs, config: Option<&Config>) -> Result<()
                     Ok(artists) if !artists.is_empty() => {
                         println!("{}  ", "Artists:".yellow());
                         for artist in &artists {
-                            let name = artist
-                                .name
-                                .as_deref()
-                                .unwrap_or("(unknown)");
+                            let name = artist.name.as_deref().unwrap_or("(unknown)");
                             let mut line = format!("    - {}", name);
                             if let Some(ref role) = artist.role {
                                 line.push_str(&format!(" ({})", role));
@@ -612,7 +623,9 @@ fn cmd_query(args: &cli::query::QueryArgs, config: Option<&Config>) -> Result<()
                         }
                     }
                     Ok(_) => println!("{}  (none)", "Artists:".yellow()),
-                    Err(e) => tracing::warn!(error = %e, album_id = %album.id, "Failed to fetch artists"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, album_id = %album.id, "Failed to fetch artists")
+                    }
                 }
 
                 // Genres on this album
@@ -661,10 +674,7 @@ fn cmd_query(args: &cli::query::QueryArgs, config: Option<&Config>) -> Result<()
                 Ok(artists) if !artists.is_empty() => {
                     println!("\n{}  ({} found)", "Artists".bold().cyan(), artists.len());
                     for artist in &artists {
-                        let name = artist
-                            .name
-                            .as_deref()
-                            .unwrap_or("(unknown)");
+                        let name = artist.name.as_deref().unwrap_or("(unknown)");
                         println!("  {}  {}", "•".yellow(), name);
                     }
                 }

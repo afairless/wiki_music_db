@@ -120,7 +120,10 @@ fn populate_test_data(conn: &Connection) {
 fn test_query_artist_empty_db() {
     let conn = test_conn();
     let results = query::search_artist(&conn, "anything").unwrap();
-    assert!(results.is_empty(), "Empty database should return no artists");
+    assert!(
+        results.is_empty(),
+        "Empty database should return no artists"
+    );
 }
 
 #[test]
@@ -186,7 +189,10 @@ fn test_query_album_one_result() {
     assert_eq!(results.len(), 1, "Should find exactly one album");
     assert_eq!(results[0].id, "A1");
     assert_eq!(results[0].name, "Kind of Blue");
-    assert_eq!(results[0].release_date, NaiveDate::from_ymd_opt(1959, 8, 17));
+    assert_eq!(
+        results[0].release_date,
+        NaiveDate::from_ymd_opt(1959, 8, 17)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -312,7 +318,11 @@ fn test_query_genre_pagination_offset() {
     // 'a' matches: Classical, Jazz, Reggaeton (alphabetically)
     // Offset 2 should skip Classical and Jazz, return Reggaeton
     let results = query::search_genre(&conn, "a", 20, 2).unwrap();
-    assert_eq!(results.len(), 1, "Offset 2 should return 1 remaining result");
+    assert_eq!(
+        results.len(),
+        1,
+        "Offset 2 should return 1 remaining result"
+    );
     assert_eq!(results[0].name, "Reggaeton");
 }
 
@@ -332,7 +342,11 @@ fn test_query_artist_many_results() {
 
     // Search for a partial term that matches multiple artists
     let results = query::search_artist(&conn, "Miles").unwrap();
-    assert_eq!(results.len(), 1, "Should find exactly 1 artist matching 'Miles'");
+    assert_eq!(
+        results.len(),
+        1,
+        "Should find exactly 1 artist matching 'Miles'"
+    );
     assert_eq!(results[0].id, "Q1");
 
     // Search for term that matches multiple
@@ -408,7 +422,11 @@ fn test_query_like_fallback_description() {
 
     // Search by description content
     let results = query::search_artist(&conn, "trumpet").unwrap();
-    assert_eq!(results.len(), 1, "LIKE should find 'trumpet' in description");
+    assert_eq!(
+        results.len(),
+        1,
+        "LIKE should find 'trumpet' in description"
+    );
 }
 
 #[test]
@@ -442,10 +460,16 @@ fn test_query_detail_empty_result_sets() {
     .unwrap();
 
     let genres = query::artist_genres(&conn, "Q99").unwrap();
-    assert!(genres.is_empty(), "Artist with no genres should return empty");
+    assert!(
+        genres.is_empty(),
+        "Artist with no genres should return empty"
+    );
 
     let albums = query::artist_albums(&conn, "Q99").unwrap();
-    assert!(albums.is_empty(), "Artist with no albums should return empty");
+    assert!(
+        albums.is_empty(),
+        "Artist with no albums should return empty"
+    );
 
     let instruments = query::artist_instruments(&conn, "Q99").unwrap();
     assert!(
@@ -467,7 +491,10 @@ fn test_query_album_no_tracks() {
     .unwrap();
 
     let tracks = query::album_tracks(&conn, "A99").unwrap();
-    assert!(tracks.is_empty(), "Album with no tracks should return empty");
+    assert!(
+        tracks.is_empty(),
+        "Album with no tracks should return empty"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -511,5 +538,8 @@ fn test_query_album_null_release_date() {
     let results = query::search_album(&conn, "No Date Album").unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, "A100");
-    assert_eq!(results[0].release_date, None, "NULL release_date should be None");
+    assert_eq!(
+        results[0].release_date, None,
+        "NULL release_date should be None"
+    );
 }

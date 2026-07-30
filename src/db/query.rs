@@ -14,7 +14,7 @@
 //! fallback is automatic and logged at debug level.
 
 use chrono::NaiveDate;
-use duckdb::{params, Connection};
+use duckdb::{Connection, params};
 
 use crate::db::schema::{fts_available, fts_index_exists};
 use anyhow::{Context, Result};
@@ -93,14 +93,12 @@ pub fn search_artist(conn: &Connection, term: &str) -> Result<Vec<ArtistSearchRe
 
     if fts_available(conn)? && fts_index_exists(conn, "artist")? {
         // FTS query path
-        let rows = search_artist_fts(conn, term)
-            .context("FTS artist search failed")?;
+        let rows = search_artist_fts(conn, term).context("FTS artist search failed")?;
         tracing::debug!(term, count = rows.len(), "FTS artist search");
         Ok(rows)
     } else {
         // LIKE fallback path
-        let rows = search_artist_like(conn, term)
-            .context("LIKE artist search failed")?;
+        let rows = search_artist_like(conn, term).context("LIKE artist search failed")?;
         tracing::debug!(term, count = rows.len(), "LIKE artist search");
         Ok(rows)
     }
@@ -169,9 +167,8 @@ pub fn search_album(conn: &Connection, term: &str) -> Result<Vec<AlbumSearchResu
     }
 
     if fts_available(conn)? && fts_index_exists(conn, "album")? {
-        let mut stmt = conn.prepare(
-            "SELECT id, name, release_date FROM album WHERE fts_match_album(?1)",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id, name, release_date FROM album WHERE fts_match_album(?1)")?;
 
         let rows = stmt
             .query_map(params![term], |row| {
@@ -223,9 +220,8 @@ pub fn search_track(conn: &Connection, term: &str) -> Result<Vec<TrackSearchResu
     }
 
     if fts_available(conn)? && fts_index_exists(conn, "track")? {
-        let mut stmt = conn.prepare(
-            "SELECT id, name, duration_seconds FROM track WHERE fts_match_track(?1)",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id, name, duration_seconds FROM track WHERE fts_match_track(?1)")?;
 
         let rows = stmt
             .query_map(params![term], |row| {
@@ -417,7 +413,10 @@ pub fn artist_albums(conn: &Connection, artist_id: &str) -> Result<Vec<ArtistAlb
 }
 
 /// Look up instruments played by a given artist.
-pub fn artist_instruments(conn: &Connection, artist_id: &str) -> Result<Vec<ArtistInstrumentResult>> {
+pub fn artist_instruments(
+    conn: &Connection,
+    artist_id: &str,
+) -> Result<Vec<ArtistInstrumentResult>> {
     let mut stmt = conn.prepare(
         "SELECT instrument_id \
          FROM artist_instrument \
@@ -622,11 +621,8 @@ mod tests {
 
     /// Helper: insert a test track.
     fn insert_test_track(conn: &Connection) {
-        conn.execute(
-            "INSERT INTO track (id, name) VALUES ('T1', 'So What')",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO track (id, name) VALUES ('T1', 'So What')", [])
+            .unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -641,10 +637,7 @@ mod tests {
         let results = search_artist(&conn, "Miles").unwrap();
         assert_eq!(results.len(), 1, "LIKE should find 'Miles'");
         assert_eq!(results[0].id, "Q1");
-        assert_eq!(
-            results[0].name.as_deref(),
-            Some("Miles Davis")
-        );
+        assert_eq!(results[0].name.as_deref(), Some("Miles Davis"));
     }
 
     #[test]
@@ -664,7 +657,11 @@ mod tests {
 
         // Search by description content
         let results = search_artist(&conn, "trumpet").unwrap();
-        assert_eq!(results.len(), 1, "LIKE should find 'trumpet' in description");
+        assert_eq!(
+            results.len(),
+            1,
+            "LIKE should find 'trumpet' in description"
+        );
     }
 
     #[test]
@@ -698,10 +695,7 @@ mod tests {
         );
 
         let results = search_artist(&conn, "100%").unwrap();
-        assert!(
-            results.is_empty(),
-            "Percent char should not cause error"
-        );
+        assert!(results.is_empty(), "Percent char should not cause error");
     }
 
     #[test]
@@ -896,10 +890,7 @@ mod tests {
         );
 
         let results = search_genre(&conn, "100%", 20, 0).unwrap();
-        assert!(
-            results.is_empty(),
-            "Percent char should not cause error"
-        );
+        assert!(results.is_empty(), "Percent char should not cause error");
     }
 
     #[test]
@@ -915,11 +906,8 @@ mod tests {
     fn test_search_genre_result_fields() {
         let conn = test_conn();
 
-        conn.execute(
-            "INSERT INTO genre (id, name) VALUES ('G100', 'Blues')",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO genre (id, name) VALUES ('G100', 'Blues')", [])
+            .unwrap();
 
         let results = search_genre(&conn, "Blues", 20, 0).unwrap();
         assert_eq!(results.len(), 1);
@@ -1063,7 +1051,10 @@ mod tests {
         .unwrap();
 
         let results = artist_genres(&conn, "Q99").unwrap();
-        assert!(results.is_empty(), "No genre associations should return empty");
+        assert!(
+            results.is_empty(),
+            "No genre associations should return empty"
+        );
     }
 
     #[test]
@@ -1101,7 +1092,10 @@ mod tests {
         .unwrap();
 
         let results = artist_albums(&conn, "Q99").unwrap();
-        assert!(results.is_empty(), "No album associations should return empty");
+        assert!(
+            results.is_empty(),
+            "No album associations should return empty"
+        );
     }
 
     #[test]
@@ -1140,11 +1134,7 @@ mod tests {
         insert_test_related_data(&conn);
 
         let results = album_artists(&conn, "A1").unwrap();
-        assert_eq!(
-            results.len(),
-            2,
-            "Kind of Blue should have 2 artists"
-        );
+        assert_eq!(results.len(), 2, "Kind of Blue should have 2 artists");
         // Sorted by name alphabetically: John Coltrane (Q2) before Miles Davis (Q1)
         assert_eq!(results[0].id, "Q2");
         assert_eq!(results[0].name.as_deref(), Some("John Coltrane"));
@@ -1165,7 +1155,10 @@ mod tests {
         .unwrap();
 
         let results = album_artists(&conn, "A99").unwrap();
-        assert!(results.is_empty(), "No artist associations should return empty");
+        assert!(
+            results.is_empty(),
+            "No artist associations should return empty"
+        );
     }
 
     #[test]
@@ -1191,7 +1184,10 @@ mod tests {
         .unwrap();
 
         let results = album_genres(&conn, "A99").unwrap();
-        assert!(results.is_empty(), "No genre associations should return empty");
+        assert!(
+            results.is_empty(),
+            "No genre associations should return empty"
+        );
     }
 
     #[test]
@@ -1200,11 +1196,7 @@ mod tests {
         insert_test_related_data(&conn);
 
         let results = album_tracks(&conn, "A1").unwrap();
-        assert_eq!(
-            results.len(),
-            2,
-            "Kind of Blue should have 2 tracks"
-        );
+        assert_eq!(results.len(), 2, "Kind of Blue should have 2 tracks");
         assert_eq!(results[0].id, "T1");
         assert_eq!(results[0].name, "So What");
         assert_eq!(results[0].duration_seconds, Some(562));
@@ -1226,7 +1218,10 @@ mod tests {
         .unwrap();
 
         let results = album_tracks(&conn, "A99").unwrap();
-        assert!(results.is_empty(), "No track associations should return empty");
+        assert!(
+            results.is_empty(),
+            "No track associations should return empty"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1285,7 +1280,10 @@ mod tests {
         .unwrap();
 
         let results = genre_artists(&conn, "G99", 20, 0).unwrap();
-        assert!(results.is_empty(), "No artist associations should return empty");
+        assert!(
+            results.is_empty(),
+            "No artist associations should return empty"
+        );
     }
 
     #[test]

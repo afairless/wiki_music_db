@@ -1,6 +1,7 @@
-#![allow(dead_code)]
-
 use duckdb::{Connection, Result as DuckDbResult};
+
+/// Key name for the sync state row that tracks the last incremental update timestamp.
+pub const SYNC_STATE_KEY: &str = "last_sync";
 
 /// Expected schema version for this application.
 pub const SCHEMA_VERSION: i32 = 1;
@@ -90,6 +91,11 @@ const CREATE_TABLE_STATEMENTS: &[&str] = &[
         group_id  TEXT NOT NULL REFERENCES artist(id),
         PRIMARY KEY (artist_id, group_id)
     )",
+    // Sync state for incremental update tracking
+    "CREATE TABLE IF NOT EXISTS sync_state (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )",
 ];
 
 /// Index statements that follow table creation.
@@ -176,19 +182,16 @@ pub fn create_fts_indexes(conn: &Connection) -> DuckDbResult<()> {
     // Quick check: if FTS is not loaded or the PRAGMA isn't registered,
     // skip creation and let the query layer use LIKE fallback.
     if !fts_available(conn)? {
-        tracing::warn!(
-            "DuckDB FTS extension not available; LIKE fallback will be used"
-        );
+        tracing::warn!("DuckDB FTS extension not available; LIKE fallback will be used");
         return Ok(());
     }
 
-    let has_pragma: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM duckdb_functions() \
+    let has_pragma: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM duckdb_functions() \
              WHERE function_name = 'create_fts_index'",
-            [],
-            |row| row.get(0),
-        )?;
+        [],
+        |row| row.get(0),
+    )?;
 
     if !has_pragma {
         tracing::warn!(
@@ -221,9 +224,7 @@ pub fn create_fts_indexes(conn: &Connection) -> DuckDbResult<()> {
     )?;
 
     if shadow_count >= 3 {
-        tracing::info!(
-            "FTS indexes created on artist, album, and track tables"
-        );
+        tracing::info!("FTS indexes created on artist, album, and track tables");
     } else {
         tracing::warn!(
             "FTS extension loaded but could not create indexes \
@@ -243,13 +244,12 @@ pub fn create_fts_indexes(conn: &Connection) -> DuckDbResult<()> {
 /// Both conditions must be true for FTS to be usable.
 pub fn fts_available(conn: &Connection) -> DuckDbResult<bool> {
     // Check that the FTS extension is loaded.
-    let loaded: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM duckdb_extensions() \
+    let loaded: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM duckdb_extensions() \
              WHERE extension_name = 'fts' AND loaded = true",
-            [],
-            |row| row.get(0),
-        )?;
+        [],
+        |row| row.get(0),
+    )?;
 
     if !loaded {
         return Ok(false);
@@ -258,14 +258,13 @@ pub fn fts_available(conn: &Connection) -> DuckDbResult<bool> {
     // Check that FTS table functions exist (indexes were created).
     // This handles the case where the FTS extension is loaded but
     // cannot actually create indexes (common in bundled builds).
-    let has_functions: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM duckdb_functions() \
+    let has_functions: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM duckdb_functions() \
              WHERE function_name LIKE 'fts\\_main\\_%' ESCAPE '\\' \
              AND function_type = 'table'",
-            [],
-            |row| row.get(0),
-        )?;
+        [],
+        |row| row.get(0),
+    )?;
 
     Ok(has_functions)
 }
@@ -285,6 +284,43 @@ pub fn fts_index_exists(conn: &Connection, table: &str) -> DuckDbResult<bool> {
     Ok(count > 0)
 }
 
+/// Read the last sync timestamp from the `sync_state` table.
+///
+/// Returns `None` if no sync has ever been performed (the key does not
+/// exist in the table).
+pub fn get_last_sync_timestamp(conn: &Connection) -> DuckDbResult<Option<String>> {
+    let result: Option<String> = conn
+        .query_row(
+            "SELECT value FROM sync_state WHERE key = ?1",
+            duckdb::params![SYNC_STATE_KEY],
+            |row| row.get(0),
+        )
+        .ok();
+    tracing::debug!(
+        timestamp = ?result,
+        "Read last sync timestamp"
+    );
+    Ok(result)
+}
+
+/// Update the last sync timestamp in the `sync_state` table.
+///
+/// Uses `INSERT OR REPLACE` so the call is idempotent.
+/// The `timestamp` should be an ISO 8601 string (e.g.
+/// `"2026-07-17T00:00:00Z"`).
+pub fn update_sync_timestamp(conn: &Connection, timestamp: &str) -> DuckDbResult<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_state (key, value) VALUES (?1, ?2)",
+        duckdb::params![SYNC_STATE_KEY, timestamp],
+    )?;
+    tracing::info!(
+        key = SYNC_STATE_KEY,
+        timestamp = timestamp,
+        "Updated sync state timestamp"
+    );
+    Ok(())
+}
+
 /// Check whether all expected tables exist in the database.
 pub fn all_tables_exist(conn: &Connection) -> DuckDbResult<bool> {
     let table_names = [
@@ -300,6 +336,7 @@ pub fn all_tables_exist(conn: &Connection) -> DuckDbResult<bool> {
         "track_artist",
         "artist_instrument",
         "artist_member_of",
+        "sync_state",
     ];
 
     for name in &table_names {
@@ -502,5 +539,63 @@ mod tests {
             [],
         );
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Sync state tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_last_sync_no_sync_yet() {
+        let conn = test_conn().unwrap();
+        initialize(&conn).unwrap();
+        let ts = get_last_sync_timestamp(&conn).unwrap();
+        assert_eq!(ts, None, "Fresh database should have no sync timestamp");
+    }
+
+    #[test]
+    fn test_update_sync_timestamp() {
+        let conn = test_conn().unwrap();
+        initialize(&conn).unwrap();
+
+        update_sync_timestamp(&conn, "2026-07-17T00:00:00Z").unwrap();
+        let ts = get_last_sync_timestamp(&conn).unwrap();
+        assert_eq!(
+            ts.as_deref(),
+            Some("2026-07-17T00:00:00Z"),
+            "Should read back the written timestamp"
+        );
+    }
+
+    #[test]
+    fn test_update_sync_timestamp_replaces_old_value() {
+        let conn = test_conn().unwrap();
+        initialize(&conn).unwrap();
+
+        update_sync_timestamp(&conn, "2026-07-17T00:00:00Z").unwrap();
+        update_sync_timestamp(&conn, "2026-07-24T00:00:00Z").unwrap();
+
+        let ts = get_last_sync_timestamp(&conn).unwrap();
+        assert_eq!(
+            ts.as_deref(),
+            Some("2026-07-24T00:00:00Z"),
+            "Should return the newer timestamp after replacement"
+        );
+    }
+
+    #[test]
+    fn test_sync_state_table_created_by_initialize() {
+        let conn = test_conn().unwrap();
+        initialize(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_name = 'sync_state' AND table_schema = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "sync_state table should exist after initialize");
     }
 }

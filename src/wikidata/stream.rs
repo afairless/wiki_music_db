@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use flate2::read::MultiGzDecoder;
 
-use crate::wikidata::filter::{is_music_entity, FilterResult};
+use crate::wikidata::filter::{FilterResult, is_music_entity};
 use crate::wikidata::model::Entity;
 
 // ---------------------------------------------------------------------------
