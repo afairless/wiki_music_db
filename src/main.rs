@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use clap::CommandFactory;
 use clap::Parser;
+use clap_complete::generate_to;
 use colored::*;
 use duckdb::Connection;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -72,6 +74,7 @@ fn main() -> Result<()> {
         Command::Bootstrap(args) => cmd_bootstrap(args, config.as_ref()),
         Command::Update(args) => cmd_update(args, config.as_ref()),
         Command::Query(args) => cmd_query(args, config.as_ref()),
+        Command::Completion(args) => cmd_completion(args, &cli),
     }
 }
 
@@ -898,6 +901,16 @@ fn cmd_query(args: &cli::query::QueryArgs, config: Option<&Config>) -> Result<()
             }
         }
     }
+    Ok(())
+}
+
+/// Execute the `completion` subcommand.
+///
+/// Generates shell completion scripts for the specified shell.
+fn cmd_completion(args: &cli::CompletionArgs, _cli: &Cli) -> Result<()> {
+    let mut cmd = Cli::command();
+    let path = generate_to(args.shell, &mut cmd, "wiki_db", &args.output)?;
+    println!("Completion script generated: {}", path.display());
     Ok(())
 }
 

@@ -6,6 +6,7 @@ pub mod update;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use clap_complete::Shell;
 
 /// Default path for the optional `wiki_db.toml` config file.
 pub const DEFAULT_CONFIG_PATH: &str = "wiki_db.toml";
@@ -50,6 +51,21 @@ pub enum Command {
 
     /// Query the database for artists, albums, genres, and tracks.
     Query(query::QueryArgs),
+
+    /// Generate shell completion scripts.
+    Completion(CompletionArgs),
+}
+
+/// Arguments for the `completion` subcommand.
+#[derive(Parser, Debug)]
+pub struct CompletionArgs {
+    /// Shell to generate completions for.
+    #[arg(value_enum)]
+    pub shell: Shell,
+
+    /// Output directory for completion scripts.
+    #[arg(long, short, default_value = ".")]
+    pub output: PathBuf,
 }
 
 #[cfg(test)]
@@ -150,5 +166,60 @@ mod tests {
         let cli = Cli::try_parse_from(["wiki_db", "query", "artist", "--name", "x"]).unwrap();
         assert!(!cli.verbose);
         assert!(!cli.quiet);
+    }
+
+    #[test]
+    fn test_cli_completion_subcommand() {
+        let cli = Cli::try_parse_from(["wiki_db", "completion", "bash"]);
+        assert!(cli.is_ok(), "completion bash should be valid");
+    }
+
+    #[test]
+    fn test_cli_completion_zsh() {
+        let cli = Cli::try_parse_from(["wiki_db", "completion", "zsh"]);
+        assert!(cli.is_ok(), "completion zsh should be valid");
+    }
+
+    #[test]
+    fn test_cli_completion_output_default() {
+        let cli = Cli::try_parse_from(["wiki_db", "completion", "bash"]).unwrap();
+        if let Command::Completion(args) = &cli.command {
+            assert_eq!(args.output.to_str(), Some("."));
+        } else {
+            panic!("Expected Completion command");
+        }
+    }
+
+    #[test]
+    fn test_cli_completion_custom_output() {
+        let cli = Cli::try_parse_from([
+            "wiki_db",
+            "completion",
+            "fish",
+            "--output",
+            "/tmp/completions",
+        ])
+        .unwrap();
+        if let Command::Completion(args) = &cli.command {
+            assert_eq!(args.output.to_str(), Some("/tmp/completions"));
+        } else {
+            panic!("Expected Completion command");
+        }
+    }
+
+    #[test]
+    fn test_cli_completion_missing_shell() {
+        let cli = Cli::try_parse_from(["wiki_db", "completion"]);
+        assert!(cli.is_err(), "completion requires a shell argument");
+    }
+
+    #[test]
+    fn test_cli_completion_fish_short_output() {
+        let cli = Cli::try_parse_from(["wiki_db", "completion", "fish", "-o", "/tmp/out"]).unwrap();
+        if let Command::Completion(args) = &cli.command {
+            assert_eq!(args.output.to_str(), Some("/tmp/out"));
+        } else {
+            panic!("Expected Completion command");
+        }
     }
 }
