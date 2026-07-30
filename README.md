@@ -1,5 +1,7 @@
 # wiki_db — Local Music Database from Wikidata
 
+[![CI](https://github.com/user/wiki_db/actions/workflows/ci.yml/badge.svg)](https://github.com/user/wiki_db/actions/workflows/ci.yml)
+
 Build a fast, offline, queryable music database from the Wikidata entity dump.
 
 Streams the ~35 GB gzipped Wikidata JSON dump, filters to musical acts & artists, normalizes into a relational schema, and stores the result in an embedded DuckDB database — all from a single statically-compiled Rust binary.
@@ -169,13 +171,36 @@ cargo run --release -- bootstrap --resume
 ### Step 3 — Query the database
 
 ```bash
+# Search for an artist by name
 cargo run --release -- query artist --name "Miles Davis"
+
+# Search for a genre and list associated artists
 cargo run --release -- query genre --name "Jazz"
+
+# Search for an album with track listing
 cargo run --release -- query album --name "Kind of Blue"
+
+# Search across all entity types simultaneously
+cargo run --release -- query search --term "Miles"
 ```
 
-> **Note**: The `query` and `update` subcommands currently log "not yet implemented"
-> and exit.  Only `download` and `bootstrap` are functional.
+Query results are displayed in a formatted terminal output with colored headers.
+Artists show their genres, albums, instruments, and dates. Albums show their
+artist line-up, genre tags, and full track listing with durations.
+
+### Step 4 — Incremental update
+
+```bash
+# Fetch and merge recent changes from Wikidata
+cargo run --release -- update
+
+# Preview changes without writing
+cargo run --release -- update --dry-run
+```
+
+The update subcommand queries the Wikidata SPARQL endpoint for entities modified
+since the last sync, fetches their full data via the Wikimedia REST API, and
+upserts them into the database.
 
 ---
 
@@ -207,10 +232,15 @@ Options:
   --config <PATH>        TOML config file (default: wiki_db.toml)
 ```
 
-### `update` — Incrementally update the database (not yet implemented)
+### `update` — Incrementally update the database
 
 ```
-cargo run -- update [--since <TIMESTAMP>] [--dry-run]
+cargo run -- update [OPTIONS]
+
+Options:
+  --since <TIMESTAMP>   Sync from a specific timestamp (default: last sync state)
+  --dry-run             Print changes without writing to the database
+  --config <PATH>       TOML config file (default: wiki_db.toml)
 ```
 
 ### `query` — Search the database
@@ -222,8 +252,47 @@ cargo run -- query album    --name <NAME>
 cargo run -- query search   --term <TERM>
 ```
 
-> **Note**: The `query` and `update` subcommands currently log "not yet implemented"
-> and exit. Only `download` and `bootstrap` are functional.
+### `completion` — Generate shell completion scripts
+
+```
+cargo run -- completion <SHELL> [--output <DIR>]
+
+Arguments:
+  <SHELL>               Shell to generate completions for (bash, zsh, fish, powershell, elvish)
+
+Options:
+  --output, -o <DIR>    Output directory (default: current directory)
+  --config <PATH>       TOML config file (default: wiki_db.toml)
+```
+
+**Installation examples:**
+
+```bash
+# Bash
+cargo run -- completion bash --output ~/.local/share/bash-completion/completions/
+echo "source ~/.local/share/bash-completion/completions/wiki_db" >> ~/.bashrc
+
+# Zsh (with oh-my-zsh)
+cargo run -- completion zsh --output ~/.zsh/completion/
+echo "fpath=(~/.zsh/completion \$fpath)" >> ~/.zshrc
+
+# Fish
+cargo run -- completion fish --output ~/.config/fish/completions/
+```
+
+### Global flags
+
+These flags are available on every subcommand:
+
+```
+  --config <PATH>   TOML config file (default: wiki_db.toml)
+  -v, --verbose     Increase log verbosity to debug level
+  -q, --quiet       Decrease log verbosity to warn level
+  -h, --help        Print help
+  -V, --version     Print version
+```
+
+Log level precedence: `RUST_LOG` env var > `--verbose`/`--quiet` > config file > `info` (default).
 
 ## Database Schema
 
@@ -316,8 +385,6 @@ scripts/           — Helper scripts (dump downloader)
 
 - **English-only**: Artists without English labels get NULL names (stored, not rejected)
 - **Album/track names**: Use Wikidata Q-ID placeholders — actual name resolution is deferred
-- **No full-text search**: Phase 5 (FTS indexes) not yet implemented
-- **No incremental updates**: Re-bootstrap for fresh data (Phase 7 not yet implemented)
 - **Resume v1**: `--resume` restarts streaming from the beginning; only Parquet files are skipped
 
 ## License
