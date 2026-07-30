@@ -21,6 +21,18 @@ pub struct Cli {
     #[arg(long, global = true, default_value = DEFAULT_CONFIG_PATH)]
     pub config: PathBuf,
 
+    /// Increase log verbosity to debug level.
+    ///
+    /// If `RUST_LOG` is set, this flag is ignored (env var takes precedence).
+    #[arg(long, short, global = true, conflicts_with = "quiet")]
+    pub verbose: bool,
+
+    /// Decrease log verbosity to warn level.
+    ///
+    /// If `RUST_LOG` is set, this flag is ignored (env var takes precedence).
+    #[arg(long, short = 'q', global = true, conflicts_with = "verbose")]
+    pub quiet: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -87,5 +99,56 @@ mod tests {
     fn test_cli_config_default() {
         let cli = Cli::try_parse_from(["wiki_db", "query", "artist", "--name", "x"]).unwrap();
         assert_eq!(cli.config.to_str(), Some("wiki_db.toml"));
+    }
+
+    #[test]
+    fn test_cli_verbose_flag() {
+        let cli = Cli::try_parse_from(["wiki_db", "--verbose", "query", "artist", "--name", "x"])
+            .unwrap();
+        assert!(cli.verbose);
+        assert!(!cli.quiet);
+    }
+
+    #[test]
+    fn test_cli_verbose_short() {
+        let cli = Cli::try_parse_from(["wiki_db", "-v", "query", "artist", "--name", "x"]).unwrap();
+        assert!(cli.verbose);
+        assert!(!cli.quiet);
+    }
+
+    #[test]
+    fn test_cli_quiet_flag() {
+        let cli =
+            Cli::try_parse_from(["wiki_db", "--quiet", "query", "artist", "--name", "x"]).unwrap();
+        assert!(!cli.verbose);
+        assert!(cli.quiet);
+    }
+
+    #[test]
+    fn test_cli_quiet_short() {
+        let cli = Cli::try_parse_from(["wiki_db", "-q", "query", "artist", "--name", "x"]).unwrap();
+        assert!(!cli.verbose);
+        assert!(cli.quiet);
+    }
+
+    #[test]
+    fn test_cli_verbose_quiet_conflict() {
+        let cli = Cli::try_parse_from([
+            "wiki_db",
+            "--verbose",
+            "--quiet",
+            "query",
+            "artist",
+            "--name",
+            "x",
+        ]);
+        assert!(cli.is_err(), "--verbose and --quiet should conflict");
+    }
+
+    #[test]
+    fn test_cli_verbose_default_false() {
+        let cli = Cli::try_parse_from(["wiki_db", "query", "artist", "--name", "x"]).unwrap();
+        assert!(!cli.verbose);
+        assert!(!cli.quiet);
     }
 }

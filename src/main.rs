@@ -24,6 +24,18 @@ fn main() -> Result<()> {
     // Parse CLI args first so we can read the --config flag.
     let cli = Cli::parse();
 
+    // Apply --verbose / --quiet flags to the RUST_LOG env var.
+    // SAFETY: This is called at the very start of `main()`, before any threads
+    // are spawned, so it cannot race with other readers of RUST_LOG. The single
+    // thread ensures no data races — the canonical safe scenario for set_var.
+    if std::env::var("RUST_LOG").is_err() {
+        if cli.verbose {
+            unsafe { std::env::set_var("RUST_LOG", "debug") };
+        } else if cli.quiet {
+            unsafe { std::env::set_var("RUST_LOG", "warn") };
+        }
+    }
+
     // Initialize structured logging: RUST_LOG env var > "info"
     // NOTE: logging is initialized BEFORE config loading so that config load
     // errors are visible (tracing::warn! needs an active subscriber).
