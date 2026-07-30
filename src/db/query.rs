@@ -257,6 +257,86 @@ pub fn search_track(conn: &Connection, term: &str) -> Result<Vec<TrackSearchResu
     }
 }
 
+/// A search result row from the genre table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenreSearchResult {
+    /// Wikidata ID (e.g., "Q35718").
+    pub id: String,
+    /// Genre name (e.g., "jazz").
+    pub name: String,
+}
+
+// ---------------------------------------------------------------------------
+// Genre search
+// ---------------------------------------------------------------------------
+
+const LIKE_SEARCH_GENRE: &str = "\
+SELECT id, name
+FROM genre
+WHERE name LIKE '%' || ?1 || '%'
+ORDER BY name
+LIMIT ?
+OFFSET ?";
+
+/// Search genres by name using FTS when available, falling back to LIKE.
+///
+/// Unlike [`search_artist`], this function accepts pagination parameters
+/// (`limit` and `offset`) to support browsing large genre result sets.
+///
+/// # Arguments
+///
+/// * `conn` — A reference to an open DuckDB connection.
+/// * `term` — The search term. An empty string returns no results.
+/// * `limit` — Maximum number of results to return.
+/// * `offset` — Number of results to skip (for pagination).
+///
+/// # Returns
+///
+/// A vector of matching [`GenreSearchResult`] rows, sorted by name.
+/// Returns an empty vec when no matches are found.
+pub fn search_genre(
+    conn: &Connection,
+    term: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<GenreSearchResult>> {
+    if term.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if fts_available(conn)? && fts_index_exists(conn, "genre")? {
+        let mut stmt = conn.prepare(
+            "SELECT id, name FROM genre WHERE fts_match_genre(?1) ORDER BY name LIMIT ? OFFSET ?",
+        )?;
+
+        let rows = stmt
+            .query_map(params![term, limit as i64, offset as i64], |row| {
+                Ok(GenreSearchResult {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        tracing::debug!(term, count = rows.len(), "FTS genre search");
+        Ok(rows)
+    } else {
+        let mut stmt = conn.prepare(LIKE_SEARCH_GENRE)?;
+
+        let rows = stmt
+            .query_map(params![term, limit as i64, offset as i64], |row| {
+                Ok(GenreSearchResult {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        tracing::debug!(term, count = rows.len(), "LIKE genre search");
+        Ok(rows)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +539,141 @@ mod tests {
         assert_eq!(r.artist_type, "person");
         assert_eq!(r.birth_date, NaiveDate::from_ymd_opt(1926, 9, 23));
         assert_eq!(r.death_date, NaiveDate::from_ymd_opt(1967, 7, 17));
+    }
+
+    // -------------------------------------------------------------------
+    // Genre search tests
+    // -------------------------------------------------------------------
+
+    /// Helper: insert test genres.
+    fn insert_test_genres(conn: &Connection) {
+        conn.execute("INSERT INTO genre (id, name) VALUES ('G1', 'Jazz')", [])
+            .unwrap();
+        conn.execute("INSERT INTO genre (id, name) VALUES ('G2', 'Rock')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO genre (id, name) VALUES ('G3', 'Classical')",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_search_genre_like_fallback() {
+        let conn = test_conn();
+        insert_test_genres(&conn);
+
+        let results = search_genre(&conn, "Jazz", 20, 0).unwrap();
+        assert_eq!(results.len(), 1, "LIKE should find 'Jazz'");
+        assert_eq!(results[0].id, "G1");
+        assert_eq!(results[0].name, "Jazz");
+    }
+
+    #[test]
+    fn test_search_genre_partial_match() {
+        let conn = test_conn();
+        insert_test_genres(&conn);
+
+        let results = search_genre(&conn, "Jaz", 20, 0).unwrap();
+        assert_eq!(results.len(), 1, "LIKE should find partial 'Jaz'");
+        assert_eq!(results[0].id, "G1");
+    }
+
+    #[test]
+    fn test_search_genre_no_match() {
+        let conn = test_conn();
+        insert_test_genres(&conn);
+
+        let results = search_genre(&conn, "Nonexistent", 20, 0).unwrap();
+        assert!(results.is_empty(), "No match should return empty vec");
+    }
+
+    #[test]
+    fn test_search_genre_empty_term() {
+        let conn = test_conn();
+        insert_test_genres(&conn);
+
+        let results = search_genre(&conn, "", 20, 0).unwrap();
+        assert!(results.is_empty(), "Empty term should return empty vec");
+    }
+
+    #[test]
+    fn test_search_genre_pagination_limit() {
+        let conn = test_conn();
+        insert_test_genres(&conn);
+
+        // Limit to 1 result
+        let results = search_genre(&conn, "a", 1, 0).unwrap();
+        assert_eq!(results.len(), 1, "Limit should cap results at 1");
+        // Should return 'Classical' (alphabetically first among matches)
+        assert_eq!(results[0].name, "Classical");
+    }
+
+    #[test]
+    fn test_search_genre_pagination_offset() {
+        let conn = test_conn();
+        insert_test_genres(&conn);
+
+        // 'a' matches 'Classical' and 'Jazz' (alphabetical order).
+        // Offset 1 should skip 'Classical', return only 'Jazz'.
+        let results = search_genre(&conn, "a", 20, 1).unwrap();
+        assert_eq!(results.len(), 1, "Offset 1 should skip first result");
+        assert_eq!(results[0].name, "Jazz");
+    }
+
+    #[test]
+    fn test_search_genre_pagination_offset_beyond_end() {
+        let conn = test_conn();
+        insert_test_genres(&conn);
+
+        // Offset beyond total count should return empty
+        let results = search_genre(&conn, "a", 20, 100).unwrap();
+        assert!(results.is_empty(), "Offset beyond end should return empty");
+    }
+
+    #[test]
+    fn test_search_genre_special_chars() {
+        let conn = test_conn();
+        insert_test_genres(&conn);
+
+        // SQL-special characters should not cause errors.
+        let results = search_genre(&conn, "' OR 1=1 --", 20, 0).unwrap();
+        assert!(
+            results.is_empty(),
+            "SQL injection attempt should return no results"
+        );
+
+        let results = search_genre(&conn, "100%", 20, 0).unwrap();
+        assert!(
+            results.is_empty(),
+            "Percent char should not cause error"
+        );
+    }
+
+    #[test]
+    fn test_search_genre_no_data() {
+        let conn = test_conn();
+
+        // No genre data — search should return empty.
+        let results = search_genre(&conn, "anything", 20, 0).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_genre_result_fields() {
+        let conn = test_conn();
+
+        conn.execute(
+            "INSERT INTO genre (id, name) VALUES ('G100', 'Blues')",
+            [],
+        )
+        .unwrap();
+
+        let results = search_genre(&conn, "Blues", 20, 0).unwrap();
+        assert_eq!(results.len(), 1);
+
+        let r = &results[0];
+        assert_eq!(r.id, "G100");
+        assert_eq!(r.name, "Blues");
     }
 }
