@@ -96,19 +96,16 @@ scripts/
 - Phase 2b: Filter + streaming parser
 - Phase 3a: Parquet writer & MusicEntity extraction
 - Phase 3b: DuckDB loader & bootstrap CLI
-
-**Not yet implemented:**
-
-- Phase 5: Full-text search
-- Phase 6: Query subcommand (CLI stubs exist, queries return "not yet implemented")
+- Phase 5: Full-text search (DuckDB `fts` extension)
+- Phase 6: Query subcommand (artist, genre, album, search)
 - Phase 7: Incremental updates (SPARQL + Wikimedia REST API)
-- Phase 8: Polish & distribution
+- Phase 8: Polish & distribution (--verbose/--quiet, shell completions, CI pipeline, documentation)
 
 ## Documentation
 
 - `ARCHITECTURE.md` — system design, module map, data flow, and key decisions.
 - `docs/research/*.md` — feature plans and design proposals.
-- `TODO.md` — the implementation plan for Phase 3b (completed).
+- `TODO.md` — the current implementation plan (Phase 8 polish & distribution).
 
 ## Agent Instructions
 

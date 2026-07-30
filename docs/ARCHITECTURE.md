@@ -258,18 +258,19 @@ First match wins. The match reason is recorded in `artist.inclusion_reason` (e.g
 
 - **English-only labels**: Artists without English labels have NULL names (stored, not rejected). Multilingual support is deferred.
 - **No album/track names**: Album and track tables use Q-ID placeholders. Name resolution is deferred.
-- **No full-text search**: Phase 5 (FTS indexes) is not yet implemented. The `query` subcommand returns "not yet implemented" for all commands.
-- **No incremental updates**: Phase 7 (SPARQL + Wikimedia REST API) is not yet implemented. Users must re-bootstrap for fresh data.
 - **Resume limitations**: `--resume` restarts streaming from the beginning of the dump (rather than mid-stream). Only Parquet files are skipped; the genre label extraction second pass is also repeated.
 - **No subclass resolution**: The filter uses hardcoded Q-ID lists. Entities with subclass-of-musician occupations that aren't in the list are missed.
 - **Single-node**: DuckDB is embedded and file-based. No concurrent access or replication.
 
+## Completed Phases
+
+- [x] Phase 5: Full-text search via DuckDB `fts` extension
+- [x] Phase 6: Query subcommand (artist, genre, album, search by name)
+- [x] Phase 7: Incremental updates via Wikidata SPARQL + Wikimedia REST API
+- [x] Phase 8: CLI polish, CI pipeline, shell completions, `--verbose` / `--quiet` flags, documentation updates
+
 ## Future Work
 
-- [ ] Phase 5: Full-text search via DuckDB `fts` extension
-- [ ] Phase 6: Query subcommand (artist, genre, album, search by name)
-- [ ] Phase 7: Incremental updates via Wikidata SPARQL + Wikimedia REST API
-- [ ] Phase 8: Polish, CI pipeline, shell completions, `--verbose` / `--quiet` flags
 - [ ] Multilingual label support (separate `label` table)
 - [ ] Album and track name resolution (second pass or SPARQL)
 - [ ] SPARQL-based subclass resolution for filter Q-IDs at bootstrap time
