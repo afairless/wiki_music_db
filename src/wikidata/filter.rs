@@ -18,7 +18,7 @@ use crate::wikidata::model::Claim;
 // ---------------------------------------------------------------------------
 
 /// Q-IDs representing music-related occupations (P106).
-const MUSIC_OCCUPATION_IDS: &[&str] = &[
+pub(crate) const MUSIC_OCCUPATION_IDS: &[&str] = &[
     "Q639669",    // musician
     "Q36834",     // composer
     "Q177220",    // singer
@@ -41,7 +41,7 @@ const MUSIC_OCCUPATION_IDS: &[&str] = &[
 ];
 
 /// Q-IDs representing music groups (P31).
-const MUSIC_GROUP_IDS: &[&str] = &[
+pub(crate) const MUSIC_GROUP_IDS: &[&str] = &[
     "Q215380",    // musical group
     "Q2088357",   // musical ensemble
     "Q5741069",   // rock band
@@ -57,7 +57,7 @@ const MUSIC_GROUP_IDS: &[&str] = &[
 ];
 
 /// Properties that indicate a music-relevant entity (catch-all heuristic).
-const MUSIC_PROPERTIES: &[&str] = &["P1303", "P175", "P136", "P358"];
+pub(crate) const MUSIC_PROPERTIES: &[&str] = &["P1303", "P175", "P136", "P358"];
 
 /// Minimum number of catch-all properties required for inclusion.
 /// Set to 1 for a wide net (prioritises recall over precision).

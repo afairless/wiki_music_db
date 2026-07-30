@@ -4,4 +4,5 @@ pub mod db;
 pub mod error;
 pub mod extraction;
 pub mod parquet_writer;
+pub mod sparql;
 pub mod wikidata;
