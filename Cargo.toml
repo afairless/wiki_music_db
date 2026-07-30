@@ -39,6 +39,9 @@ thiserror = "2"
 # Config
 toml = "0.8"
 
+# Terminal output
+colored = "2"
+
 # Utilities
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }

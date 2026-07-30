@@ -3,12 +3,14 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use colored::*;
 use duckdb::Connection;
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing_subscriber::EnvFilter;
 use wiki_db::cli::{self, Cli, Command};
 use wiki_db::config::Config;
 use wiki_db::db::load::load_all;
+use wiki_db::db::query;
 use wiki_db::db::schema;
 use wiki_db::extraction::{extract_genre_labels, extract_music_entity};
 use wiki_db::parquet_writer::{MusicEntityBatchWriter, write_genres_parquet};
@@ -460,25 +462,251 @@ fn cmd_update(_args: &cli::update::UpdateArgs, _config: Option<&Config>) -> Resu
 }
 
 /// Execute the `query` subcommand.
-fn cmd_query(args: &cli::query::QueryArgs, _config: Option<&Config>) -> Result<()> {
+fn cmd_query(args: &cli::query::QueryArgs, config: Option<&Config>) -> Result<()> {
     use cli::query::QueryCommand;
+
+    // Resolve database path: config > default
+    let db_str = config
+        .and_then(|c| c.db_path())
+        .unwrap_or_else(|| "music.duckdb".to_string());
+
+    let conn = Connection::open(&db_str)
+        .with_context(|| format!("Failed to open database: {}", db_str))?;
+
+    // Ensure schema is initialized (in case the database is new or empty)
+    schema::initialize(&conn).context("Failed to initialize schema")?;
+
     match &args.command {
         QueryCommand::Artist(a) => {
-            tracing::info!("query artist: {} (not yet implemented)", a.name);
+            let results = query::search_artist(&conn, &a.name)
+                .with_context(|| format!("Failed to search artist: {}", a.name))?;
+
+            if results.is_empty() {
+                println!("{}: No artists found matching '{}'", "No Results".bold().yellow(), a.name);
+                return Ok(());
+            }
+
+            for artist in &results {
+                println!("\n{}", "━━━ Artist ━━━".bold().cyan());
+                println!("{}  {}", "ID:".yellow(), artist.id);
+                if let Some(ref name) = artist.name {
+                    println!("{}  {}", "Name:".yellow(), name.bold());
+                }
+                if let Some(ref desc) = artist.description {
+                    println!("{}  {}", "Description:".yellow(), desc);
+                }
+                println!("{}  {}", "Type:".yellow(), artist.artist_type);
+                if let Some(date) = artist.birth_date {
+                    println!("{}  {}", "Born:".yellow(), date);
+                }
+                if let Some(date) = artist.death_date {
+                    println!("{}  {}", "Died:".yellow(), date);
+                }
+
+                // Detail lookups
+                match query::artist_genres(&conn, &artist.id) {
+                    Ok(genres) if !genres.is_empty() => {
+                        let names: Vec<&str> = genres.iter().map(|g| g.name.as_str()).collect();
+                        println!("{}  {}", "Genres:".yellow(), names.join(", "));
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, artist_id = %artist.id, "Failed to fetch genres"),
+                }
+
+                match query::artist_albums(&conn, &artist.id) {
+                    Ok(albums) if !albums.is_empty() => {
+                        println!("{}  ", "Albums:".yellow());
+                        for album in &albums {
+                            let mut line = format!("    - {}", album.name);
+                            if let Some(ref role) = album.role {
+                                line.push_str(&format!(" ({})", role));
+                            }
+                            if let Some(date) = album.release_date {
+                                line.push_str(&format!(" [{}]", date));
+                            }
+                            println!("{}", line);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, artist_id = %artist.id, "Failed to fetch albums"),
+                }
+
+                match query::artist_instruments(&conn, &artist.id) {
+                    Ok(instruments) if !instruments.is_empty() => {
+                        let ids: Vec<&str> =
+                            instruments.iter().map(|i| i.instrument_id.as_str()).collect();
+                        println!("{}  {}", "Instruments:".yellow(), ids.join(", "));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, artist_id = %artist.id, "Failed to fetch instruments")
+                    }
+                }
+            }
         }
         QueryCommand::Genre(g) => {
-            tracing::info!(
-                "query genre: {} (limit={}, offset={}) (not yet implemented)",
-                g.name,
-                g.limit,
-                g.offset
-            );
+            let results = query::search_genre(&conn, &g.name, g.limit, g.offset)
+                .with_context(|| format!("Failed to search genre: {}", g.name))?;
+
+            if results.is_empty() {
+                println!("{}: No genres found matching '{}'", "No Results".bold().yellow(), g.name);
+                return Ok(());
+            }
+
+            for genre_result in &results {
+                println!("\n{}", "━━━ Genre ━━━".bold().cyan());
+                println!("{}  {}", "ID:".yellow(), genre_result.id);
+                println!("{}  {}", "Name:".yellow(), genre_result.name.bold());
+
+                // Associated artists
+                match query::genre_artists(&conn, &genre_result.id, 20, 0) {
+                    Ok(artists) if !artists.is_empty() => {
+                        println!("{}  {} artists", "Artists:".yellow(), artists.len());
+                        for artist in &artists {
+                            let name = artist
+                                .name
+                                .as_deref()
+                                .unwrap_or("(unknown)");
+                            println!("    - {} ({})", name, artist.artist_type);
+                        }
+                        println!("      (use --limit/--offset to paginate)");
+                    }
+                    Ok(_) => println!("{}  (no artists)", "Artists:".yellow()),
+                    Err(e) => {
+                        tracing::warn!(error = %e, genre_id = %genre_result.id, "Failed to fetch artists")
+                    }
+                }
+            }
         }
         QueryCommand::Album(a) => {
-            tracing::info!("query album: {} (not yet implemented)", a.name);
+            let results = query::search_album(&conn, &a.name)
+                .with_context(|| format!("Failed to search album: {}", a.name))?;
+
+            if results.is_empty() {
+                println!("{}: No albums found matching '{}'", "No Results".bold().yellow(), a.name);
+                return Ok(());
+            }
+
+            for album in &results {
+                println!("\n{}", "━━━ Album ━━━".bold().cyan());
+                println!("{}  {}", "ID:".yellow(), album.id);
+                println!("{}  {}", "Name:".yellow(), album.name.bold());
+                if let Some(date) = album.release_date {
+                    println!("{}  {}", "Released:".yellow(), date);
+                }
+
+                // Artists on this album
+                match query::album_artists(&conn, &album.id) {
+                    Ok(artists) if !artists.is_empty() => {
+                        println!("{}  ", "Artists:".yellow());
+                        for artist in &artists {
+                            let name = artist
+                                .name
+                                .as_deref()
+                                .unwrap_or("(unknown)");
+                            let mut line = format!("    - {}", name);
+                            if let Some(ref role) = artist.role {
+                                line.push_str(&format!(" ({})", role));
+                            }
+                            println!("{}", line);
+                        }
+                    }
+                    Ok(_) => println!("{}  (none)", "Artists:".yellow()),
+                    Err(e) => tracing::warn!(error = %e, album_id = %album.id, "Failed to fetch artists"),
+                }
+
+                // Genres on this album
+                match query::album_genres(&conn, &album.id) {
+                    Ok(genres) if !genres.is_empty() => {
+                        let names: Vec<&str> = genres.iter().map(|g| g.name.as_str()).collect();
+                        println!("{}  {}", "Genres:".yellow(), names.join(", "));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, album_id = %album.id, "Failed to fetch genres")
+                    }
+                }
+
+                // Track listing
+                match query::album_tracks(&conn, &album.id) {
+                    Ok(tracks) if !tracks.is_empty() => {
+                        println!("{}  ", "Tracks:".yellow());
+                        for track in &tracks {
+                            let num = track
+                                .track_number
+                                .map(|n| format!("{:02}.", n))
+                                .unwrap_or_else(|| "  -".to_string());
+                            let mut line = format!("    {} {}", num, track.name);
+                            if let Some(dur) = track.duration_seconds {
+                                let mins = dur / 60;
+                                let secs = dur % 60;
+                                line.push_str(&format!(" ({}:{:02})", mins, secs));
+                            }
+                            println!("{}", line);
+                        }
+                    }
+                    Ok(_) => println!("{}  (no tracks)", "Tracks:".yellow()),
+                    Err(e) => {
+                        tracing::warn!(error = %e, album_id = %album.id, "Failed to fetch tracks")
+                    }
+                }
+            }
         }
         QueryCommand::Search(s) => {
-            tracing::info!("query search: {} (not yet implemented)", s.term);
+            let term = &s.term;
+            println!("\n{}", format!("Searching for '{}'...", term).bold().cyan());
+
+            // Search artists
+            match query::search_artist(&conn, term) {
+                Ok(artists) if !artists.is_empty() => {
+                    println!("\n{}  ({} found)", "Artists".bold().cyan(), artists.len());
+                    for artist in &artists {
+                        let name = artist
+                            .name
+                            .as_deref()
+                            .unwrap_or("(unknown)");
+                        println!("  {}  {}", "•".yellow(), name);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "Failed to search artists"),
+            }
+
+            // Search albums
+            match query::search_album(&conn, term) {
+                Ok(albums) if !albums.is_empty() => {
+                    println!("\n{}  ({} found)", "Albums".bold().cyan(), albums.len());
+                    for album in &albums {
+                        println!("  {}  {}", "•".yellow(), album.name);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "Failed to search albums"),
+            }
+
+            // Search tracks
+            match query::search_track(&conn, term) {
+                Ok(tracks) if !tracks.is_empty() => {
+                    println!("\n{}  ({} found)", "Tracks".bold().cyan(), tracks.len());
+                    for track in &tracks {
+                        println!("  {}  {}", "•".yellow(), track.name);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "Failed to search tracks"),
+            }
+
+            // Check if nothing was found at all
+            let artist_count = query::search_artist(&conn, term).map_or(0, |v| v.len());
+            let album_count = query::search_album(&conn, term).map_or(0, |v| v.len());
+            let track_count = query::search_track(&conn, term).map_or(0, |v| v.len());
+            if artist_count == 0 && album_count == 0 && track_count == 0 {
+                println!(
+                    "\n{}: No results found for '{}'",
+                    "No Results".bold().yellow(),
+                    term
+                );
+            }
         }
     }
     Ok(())
