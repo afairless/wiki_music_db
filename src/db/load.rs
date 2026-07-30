@@ -518,8 +518,13 @@ fn upsert_entity_inner(conn: &Connection, entity: &MusicEntity) -> Result<()> {
 ///
 /// # Errors
 ///
+/// Returns `Ok(true)` if the entity was upserted, `Ok(false)` if it was skipped
+/// (no longer matches music criteria).
+///
+/// # Errors
+///
 /// Returns an error if extraction fails for a valid music entity.
-pub fn upsert_entity_from_json(conn: &Connection, entity: &Entity) -> Result<()> {
+pub fn upsert_entity_from_json(conn: &Connection, entity: &Entity) -> Result<bool> {
     let filter_result = is_music_entity(&entity.claims);
 
     if !filter_result.is_included() {
@@ -527,7 +532,7 @@ pub fn upsert_entity_from_json(conn: &Connection, entity: &Entity) -> Result<()>
             entity_id = %entity.id,
             "Entity no longer matches music criteria, skipping"
         );
-        return Ok(());
+        return Ok(false);
     }
 
     let inclusion_reason = filter_result.reason().unwrap_or("unknown").to_string();
@@ -544,7 +549,7 @@ pub fn upsert_entity_from_json(conn: &Connection, entity: &Entity) -> Result<()>
     upsert_entity(conn, &music_entity)
         .with_context(|| format!("Failed to upsert entity {}", entity.id))?;
 
-    Ok(())
+    Ok(true)
 }
 
 /// Update the last sync timestamp in the `sync_state` table.
