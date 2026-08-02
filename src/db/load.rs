@@ -63,6 +63,272 @@ pub fn load_all(conn: &Connection, parquet_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Label and enrichment loader (Phase: populate)
+// ---------------------------------------------------------------------------
+
+/// Orchestrate loading labels and enrichment data, then backfill names.
+///
+/// Calls `load_labels`, `load_enrichment`, and `backfill_names` in sequence.
+/// After backfilling, recreates FTS indexes so search queries find the
+/// newly-resolved names.
+///
+/// # Errors
+///
+/// Returns an error if any step fails. No partial state is persisted because
+/// `backfill_names` wraps all UPDATEs in a single transaction.
+pub fn load_label_and_enrichment(conn: &Connection, parquet_dir: &Path) -> Result<()> {
+    let labels = load_labels(conn, parquet_dir)?;
+    tracing::info!(labels, "Loaded labels");
+
+    let (instruments, record_labels, album_genres, track_albums) =
+        load_enrichment(conn, parquet_dir)?;
+    tracing::info!(
+        instruments,
+        record_labels,
+        album_genres,
+        track_albums,
+        "Loaded enrichment data"
+    );
+
+    backfill_names(conn, parquet_dir)?;
+    tracing::info!("Backfill complete");
+
+    // Recreate FTS indexes now that names are resolved
+    crate::db::schema::create_fts_indexes(conn)
+        .context("Failed to recreate FTS indexes after backfill")?;
+
+    Ok(())
+}
+
+/// Load `labels.parquet` into the `qid_label` table.
+///
+/// Reads the Parquet file and inserts `(qid, label, description)` rows
+/// via `INSERT OR IGNORE`.
+///
+/// Returns the number of rows inserted.
+pub fn load_labels(conn: &Connection, parquet_dir: &Path) -> Result<usize> {
+    let path = parquet_dir.join("labels.parquet");
+    let path_str = path
+        .to_str()
+        .context("Labels parquet path contains invalid UTF-8")?;
+
+    let sql = format!(
+        "INSERT OR IGNORE INTO qid_label (qid, label, description)
+         SELECT qid, label, description FROM read_parquet('{path_str}')"
+    );
+
+    conn.execute(&sql, [])
+        .context("Failed to load labels from Parquet")?;
+
+    let count: usize = conn
+        .query_row("SELECT COUNT(*) FROM qid_label", [], |row| row.get(0))
+        .context("Failed to count labels after load")?;
+
+    Ok(count)
+}
+
+/// Load `enrichment.parquet` and populate the lookup and junction tables.
+///
+/// Enriches the following tables:
+/// - `instrument` — from enrichment entity_type='album' with record_label_qid
+/// - `record_label` — from enrichment with record_label_qid, joined to qid_label
+/// - `album_genre` — from enrichment genre_qid (WHERE entity_type='album')
+/// - `track_album` — from enrichment parent_album_qid (WHERE entity_type='track')
+///
+/// Returns `(instrument_count, record_label_count, album_genre_count, track_album_count)`.
+pub fn load_enrichment(
+    conn: &Connection,
+    parquet_dir: &Path,
+) -> Result<(usize, usize, usize, usize)> {
+    let path = parquet_dir.join("enrichment.parquet");
+    let path_str = path
+        .to_str()
+        .context("Enrichment parquet path contains invalid UTF-8")?;
+
+    // 1. Load instruments from enrichment (record_label_qid is actually
+    //    the instrument Q-ID in the enrichment schema).
+    //    Actually, instruments come from artist_instrument, not enrichment.
+    //    The enrichment.parquet has record_label_qid which is for record labels.
+    //    Instruments are resolved by looking up instrument Q-IDs in qid_label.
+    let instrument_sql = "INSERT OR IGNORE INTO instrument (id, name)
+         SELECT DISTINCT ai.instrument_id, ql.label
+         FROM artist_instrument ai
+         INNER JOIN qid_label ql ON ql.qid = ai.instrument_id
+         WHERE ql.label IS NOT NULL"
+        .to_string();
+    conn.execute(&instrument_sql, [])
+        .context("Failed to load instruments from enrichment")?;
+
+    let instrument_count: usize = conn
+        .query_row("SELECT COUNT(*) FROM instrument", [], |row| row.get(0))
+        .context("Failed to count instruments after load")?;
+
+    // 2. Load record labels from enrichment
+    let record_label_sql = format!(
+        "INSERT OR IGNORE INTO record_label (id, name)
+         SELECT DISTINCT e.record_label_qid, ql.label
+         FROM read_parquet('{path_str}') e
+         INNER JOIN qid_label ql ON ql.qid = e.record_label_qid
+         WHERE e.record_label_qid IS NOT NULL
+           AND ql.label IS NOT NULL"
+    );
+    conn.execute(&record_label_sql, [])
+        .context("Failed to load record labels from enrichment")?;
+
+    let record_label_count: usize = conn
+        .query_row("SELECT COUNT(*) FROM record_label", [], |row| row.get(0))
+        .context("Failed to count record labels after load")?;
+
+    // 3. Load album_genre junction table
+    let album_genre_sql = format!(
+        "INSERT OR IGNORE INTO album_genre (album_id, genre_id)
+         SELECT DISTINCT e.entity_qid, e.genre_qid
+         FROM read_parquet('{path_str}') e
+         WHERE e.entity_type = 'album'
+           AND e.genre_qid IS NOT NULL"
+    );
+    conn.execute(&album_genre_sql, [])
+        .context("Failed to load album_genre from enrichment")?;
+
+    let album_genre_count: usize = conn
+        .query_row("SELECT COUNT(*) FROM album_genre", [], |row| row.get(0))
+        .context("Failed to count album_genre after load")?;
+
+    // 4. Load track_album junction table
+    let track_album_sql = format!(
+        "INSERT OR IGNORE INTO track_album (track_id, album_id)
+         SELECT DISTINCT e.entity_qid, e.parent_album_qid
+         FROM read_parquet('{path_str}') e
+         WHERE e.entity_type = 'track'
+           AND e.parent_album_qid IS NOT NULL"
+    );
+    conn.execute(&track_album_sql, [])
+        .context("Failed to load track_album from enrichment")?;
+
+    let track_album_count: usize = conn
+        .query_row("SELECT COUNT(*) FROM track_album", [], |row| row.get(0))
+        .context("Failed to count track_album after load")?;
+
+    Ok((
+        instrument_count,
+        record_label_count,
+        album_genre_count,
+        track_album_count,
+    ))
+}
+
+/// Backfill name columns from the `qid_label` table.
+///
+/// Wraps all UPDATEs in a single DuckDB transaction so a mid-backfill
+/// failure leaves the database unchanged.
+///
+/// Also sets enrichment fields (release_date, record_label, duration_seconds)
+/// from the enrichment Parquet data.
+pub fn backfill_names(conn: &Connection, parquet_dir: &Path) -> Result<()> {
+    let path = parquet_dir.join("enrichment.parquet");
+    let path_str = path
+        .to_str()
+        .context("Enrichment parquet path contains invalid UTF-8")?;
+
+    conn.execute("BEGIN TRANSACTION", [])
+        .context("Failed to begin backfill transaction")?;
+
+    let result = backfill_names_inner(conn, path_str);
+
+    match result {
+        Ok(()) => {
+            conn.execute("COMMIT", [])
+                .context("Failed to commit backfill transaction")?;
+            tracing::info!("Backfill committed successfully");
+            Ok(())
+        }
+        Err(e) => {
+            conn.execute("ROLLBACK", [])
+                .context("Failed to roll back backfill transaction")?;
+            tracing::warn!(error = %e, "Rolled back backfill due to error");
+            Err(e)
+        }
+    }
+}
+
+/// Inner backfill logic (runs inside a transaction).
+fn backfill_names_inner(conn: &Connection, enrichment_path: &str) -> Result<()> {
+    // 1. Backfill album.name from qid_label
+    conn.execute(
+        "UPDATE album SET name = COALESCE(
+             (SELECT label FROM qid_label WHERE qid = album.id),
+             album.name
+         )",
+        [],
+    )
+    .context("Failed to backfill album.name")?;
+    tracing::debug!("Backfilled album.name");
+
+    // 2. Backfill track.name from qid_label
+    conn.execute(
+        "UPDATE track SET name = COALESCE(
+             (SELECT label FROM qid_label WHERE qid = track.id),
+             track.name
+         )",
+        [],
+    )
+    .context("Failed to backfill track.name")?;
+    tracing::debug!("Backfilled track.name");
+
+    // 3. Backfill artist.name from qid_label (NULL/QID names only)
+    conn.execute(
+        "UPDATE artist SET name = COALESCE(
+             (SELECT label FROM qid_label WHERE qid = artist.id),
+             artist.name
+         )
+         WHERE name IS NULL OR name = id",
+        [],
+    )
+    .context("Failed to backfill artist.name")?;
+    tracing::debug!("Backfilled artist.name");
+
+    // 4. Backfill album.release_date from enrichment
+    let release_date_sql = format!(
+        "UPDATE album SET release_date = e.release_date::DATE
+         FROM read_parquet('{enrichment_path}') e
+         WHERE e.entity_qid = album.id
+           AND e.entity_type = 'album'
+           AND e.release_date IS NOT NULL"
+    );
+    conn.execute(&release_date_sql, [])
+        .context("Failed to backfill album.release_date")?;
+    tracing::debug!("Backfilled album.release_date");
+
+    // 5. Backfill album.record_label from enrichment (resolved via qid_label)
+    let record_label_sql = format!(
+        "UPDATE album SET record_label = ql.label
+         FROM read_parquet('{enrichment_path}') e
+         INNER JOIN qid_label ql ON ql.qid = e.record_label_qid
+         WHERE e.entity_qid = album.id
+           AND e.entity_type = 'album'
+           AND e.record_label_qid IS NOT NULL
+           AND ql.label IS NOT NULL"
+    );
+    conn.execute(&record_label_sql, [])
+        .context("Failed to backfill album.record_label")?;
+    tracing::debug!("Backfilled album.record_label");
+
+    // 6. Backfill track.duration_seconds from enrichment
+    let duration_sql = format!(
+        "UPDATE track SET duration_seconds = CAST(e.duration_seconds AS INTEGER)
+         FROM read_parquet('{enrichment_path}') e
+         WHERE e.entity_qid = track.id
+           AND e.entity_type = 'track'
+           AND e.duration_seconds IS NOT NULL"
+    );
+    conn.execute(&duration_sql, [])
+        .context("Failed to backfill track.duration_seconds")?;
+    tracing::debug!("Backfilled track.duration_seconds");
+
+    Ok(())
+}
+
 /// Load the `genres.parquet` file into the `genre` table.
 ///
 /// Reads all rows from `<parquet_dir>/genres.parquet` and inserts them
