@@ -1575,6 +1575,7 @@ mod tests {
                         mainsnak: Some(crate::wikidata::model::Mainsnak {
                             snaktype: "value".to_string(),
                             datavalue: Some(crate::wikidata::model::DatavalueValue {
+                                precision: None,
                                 id: Some("Q639669".to_string()),
                                 time: None,
                             }),

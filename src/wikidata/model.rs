@@ -108,14 +108,18 @@ pub struct Mainsnak {
 
 /// The extracted value from a mainsnak's datavalue.
 ///
-/// Only `id` (for Q-ID references) and `time` (for dates) are captured.
-/// All other fields in the nested value object are silently ignored.
+/// Only `id` (for Q-ID references), `time` (for dates), and `precision`
+/// (for date precision) are captured. All other fields in the nested
+/// value object are silently ignored.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct DatavalueValue {
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
     pub time: Option<String>,
+    /// Wikidata precision code: 11=day, 10=month, 9=year, 8=decade, etc.
+    #[serde(default)]
+    pub precision: Option<i64>,
 }
 
 // --- Custom Serialize + Deserialize for Mainsnak ---
@@ -227,6 +231,7 @@ mod tests {
         assert_eq!(
             ms.datavalue,
             Some(DatavalueValue {
+                precision: None,
                 id: Some("Q639669".into()),
                 time: None
             })
@@ -247,6 +252,7 @@ mod tests {
         assert_eq!(
             ms.datavalue,
             Some(DatavalueValue {
+                precision: None,
                 id: None,
                 time: Some("+1926-09-23T00:00:00Z".into())
             })
@@ -300,6 +306,7 @@ mod tests {
         assert_eq!(
             claim.mainsnak.as_ref().unwrap().datavalue,
             Some(DatavalueValue {
+                precision: None,
                 id: Some("Q639669".into()),
                 time: None
             })
@@ -339,6 +346,7 @@ mod tests {
         assert_eq!(
             p106[0].mainsnak.as_ref().unwrap().datavalue,
             Some(DatavalueValue {
+                precision: None,
                 id: Some("Q639669".into()),
                 time: None
             })
@@ -382,6 +390,7 @@ mod tests {
                         mainsnak: Some(Mainsnak {
                             snaktype: "value".into(),
                             datavalue: Some(DatavalueValue {
+                                precision: None,
                                 id: Some("Q639669".into()),
                                 time: None,
                             }),
@@ -549,6 +558,7 @@ mod tests {
         assert_eq!(
             p31[0].mainsnak.as_ref().unwrap().datavalue,
             Some(DatavalueValue {
+                precision: None,
                 id: Some("Q215380".into()),
                 time: None
             })
@@ -640,6 +650,7 @@ mod tests {
         assert_eq!(
             p569[0].mainsnak.as_ref().unwrap().datavalue,
             Some(DatavalueValue {
+                precision: None,
                 id: None,
                 time: Some("not-a-date".into())
             })

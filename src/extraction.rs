@@ -418,6 +418,7 @@ mod tests {
             mainsnak: Some(Mainsnak {
                 snaktype: "value".into(),
                 datavalue: Some(DatavalueValue {
+                    precision: None,
                     id: Some(id.into()),
                     time: None,
                 }),
@@ -431,6 +432,7 @@ mod tests {
             mainsnak: Some(Mainsnak {
                 snaktype: "value".into(),
                 datavalue: Some(DatavalueValue {
+                    precision: None,
                     id: None,
                     time: Some(time.into()),
                 }),

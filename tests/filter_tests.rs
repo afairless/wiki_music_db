@@ -59,11 +59,13 @@ fn arb_datavalue_value() -> impl Strategy<Value = DatavalueValue> {
     prop_oneof![
         // 70% — has an id
         7 => "[Qq][0-9]{1,8}".prop_map(|id| DatavalueValue {
+            precision: None,
             id: Some(id),
             time: None,
         }),
         // 30% — no id
         3 => Just(DatavalueValue {
+            precision: None,
             id: None,
             time: None,
         }),
@@ -140,6 +142,7 @@ proptest! {
             mainsnak: Some(Mainsnak {
                 snaktype: "value".into(),
                 datavalue: Some(DatavalueValue {
+                    precision: None,
                     id: Some(occupation_qid.to_string()),
                     time: None,
                 }),
@@ -153,6 +156,7 @@ proptest! {
             mainsnak: Some(Mainsnak {
                 snaktype: "value".into(),
                 datavalue: Some(DatavalueValue {
+                    precision: None,
                     id: Some(group_qid.to_string()),
                     time: None,
                 }),
@@ -203,6 +207,7 @@ proptest! {
                 mainsnak: Some(Mainsnak {
                     snaktype: "value".into(),
                     datavalue: Some(DatavalueValue {
+                        precision: None,
                         id: Some("Q1".into()),
                         time: None,
                     }),
@@ -216,6 +221,7 @@ proptest! {
             mainsnak: Some(Mainsnak {
                 snaktype: "value".into(),
                 datavalue: Some(DatavalueValue {
+                    precision: None,
                     id: Some("Q5".into()), // "human" — not a music occupation
                     time: None,
                 }),
@@ -226,6 +232,7 @@ proptest! {
             mainsnak: Some(Mainsnak {
                 snaktype: "value".into(),
                 datavalue: Some(DatavalueValue {
+                    precision: None,
                     id: Some("Q5".into()), // "human" — not a music group
                     time: None,
                 }),
@@ -266,6 +273,7 @@ proptest! {
                 mainsnak: Some(Mainsnak {
                     snaktype: "value".into(),
                     datavalue: Some(DatavalueValue {
+                        precision: None,
                         id: Some("Q1".into()),
                         time: None,
                     }),
@@ -294,6 +302,7 @@ proptest! {
             mainsnak: Some(Mainsnak {
                 snaktype: "value".into(),
                 datavalue: Some(DatavalueValue {
+                    precision: None,
                     id: Some(group_qid.to_string()),
                     time: None,
                 }),
@@ -306,6 +315,7 @@ proptest! {
             mainsnak: Some(Mainsnak {
                 snaktype: "value".into(),
                 datavalue: Some(DatavalueValue {
+                    precision: None,
                     id: Some("Q5".into()),
                     time: None,
                 }),

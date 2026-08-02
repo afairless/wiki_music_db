@@ -401,6 +401,7 @@ mod tests {
                         mainsnak: Some(crate::wikidata::model::Mainsnak {
                             snaktype: "value".into(),
                             datavalue: Some(DatavalueValue {
+                                precision: None,
                                 id: Some("Q639669".into()),
                                 time: None,
                             }),

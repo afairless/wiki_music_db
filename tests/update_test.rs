@@ -336,6 +336,7 @@ fn test_update_entity_no_longer_music_skipped() {
                     mainsnak: Some(wiki_db::wikidata::model::Mainsnak {
                         snaktype: "value".to_string(),
                         datavalue: Some(wiki_db::wikidata::model::DatavalueValue {
+                            precision: None,
                             id: Some("Q5".to_string()),
                             time: None,
                         }),

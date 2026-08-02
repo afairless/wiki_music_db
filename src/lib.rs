@@ -3,6 +3,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod extraction;
+pub mod label_extractor;
 pub mod parquet_writer;
 pub mod sparql;
 pub mod wikidata;
