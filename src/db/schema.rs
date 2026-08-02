@@ -4,7 +4,7 @@ use duckdb::{Connection, Result as DuckDbResult};
 pub const SYNC_STATE_KEY: &str = "last_sync";
 
 /// Expected schema version for this application.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// The SQL statements to create the full database schema.
 ///
@@ -95,6 +95,23 @@ const CREATE_TABLE_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS sync_state (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
+    )",
+    // Resolved English labels for Q-IDs (populated by `populate` subcommand)
+    "CREATE TABLE IF NOT EXISTS qid_label (
+        qid         TEXT PRIMARY KEY,
+        label       TEXT,
+        description TEXT,
+        updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )",
+    // Instruments (normalized lookup table)
+    "CREATE TABLE IF NOT EXISTS instrument (
+        id   TEXT PRIMARY KEY,
+        name TEXT NOT NULL
+    )",
+    // Record labels (normalized lookup table)
+    "CREATE TABLE IF NOT EXISTS record_label (
+        id   TEXT PRIMARY KEY,
+        name TEXT NOT NULL
     )",
 ];
 
@@ -337,6 +354,9 @@ pub fn all_tables_exist(conn: &Connection) -> DuckDbResult<bool> {
         "artist_instrument",
         "artist_member_of",
         "sync_state",
+        "qid_label",
+        "instrument",
+        "record_label",
     ];
 
     for name in &table_names {
@@ -425,7 +445,7 @@ mod tests {
         let conn = test_conn().unwrap();
         initialize(&conn).unwrap();
         let version = schema_version(&conn).unwrap();
-        assert_eq!(version, Some(SCHEMA_VERSION));
+        assert_eq!(version, Some(2));
     }
 
     #[test]
@@ -434,7 +454,7 @@ mod tests {
         initialize(&conn).unwrap();
         initialize(&conn).unwrap(); // second init
         let version = schema_version(&conn).unwrap();
-        assert_eq!(version, Some(SCHEMA_VERSION));
+        assert_eq!(version, Some(2));
     }
 
     #[test]
@@ -539,6 +559,261 @@ mod tests {
             [],
         );
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // New table tests (v2 schema)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_initialize_creates_new_tables() {
+        let conn = test_conn().unwrap();
+        initialize(&conn).unwrap();
+
+        for table in &["qid_label", "instrument", "record_label"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM information_schema.tables \
+                     WHERE table_name = ?1 AND table_schema = 'main'",
+                    duckdb::params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "Table {} should exist after initialize", table);
+        }
+    }
+
+    #[test]
+    fn test_schema_version_bumped() {
+        let conn = test_conn().unwrap();
+        initialize(&conn).unwrap();
+        let version = schema_version(&conn).unwrap();
+        assert_eq!(version, Some(2), "SCHEMA_VERSION should be 2");
+    }
+
+    #[test]
+    fn test_v1_migration_path() {
+        let conn = test_conn().unwrap();
+
+        // Simulate v1: create only the original tables (without qid_label, instrument, record_label)
+        // by executing the first N CREATE TABLE statements.
+        let v1_statements: Vec<&str> = vec![
+            "CREATE TABLE IF NOT EXISTS schema_version (\
+                version INTEGER PRIMARY KEY\
+            )",
+            "CREATE TABLE IF NOT EXISTS artist (\
+                id              TEXT PRIMARY KEY,\
+                name            TEXT,\
+                description     TEXT,\
+                artist_type     TEXT NOT NULL,\
+                inclusion_reason TEXT,\
+                birth_date      DATE,\
+                death_date      DATE,\
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP\
+            )",
+            "CREATE TABLE IF NOT EXISTS genre (\
+                id   TEXT PRIMARY KEY,\
+                name TEXT NOT NULL\
+            )",
+            "CREATE TABLE IF NOT EXISTS artist_genre (\
+                artist_id TEXT NOT NULL REFERENCES artist(id),\
+                genre_id  TEXT NOT NULL REFERENCES genre(id),\
+                PRIMARY KEY (artist_id, genre_id)\
+            )",
+            "CREATE TABLE IF NOT EXISTS album (\
+                id           TEXT PRIMARY KEY,\
+                name         TEXT NOT NULL,\
+                release_date DATE,\
+                record_label TEXT,\
+                updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP\
+            )",
+            "CREATE TABLE IF NOT EXISTS album_artist (\
+                album_id  TEXT NOT NULL REFERENCES album(id),\
+                artist_id TEXT NOT NULL REFERENCES artist(id),\
+                role      TEXT,\
+                PRIMARY KEY (album_id, artist_id, role)\
+            )",
+            "CREATE TABLE IF NOT EXISTS album_genre (\
+                album_id TEXT NOT NULL REFERENCES album(id),\
+                genre_id TEXT NOT NULL REFERENCES genre(id),\
+                PRIMARY KEY (album_id, genre_id)\
+            )",
+            "CREATE TABLE IF NOT EXISTS track (\
+                id               TEXT PRIMARY KEY,\
+                name             TEXT NOT NULL,\
+                duration_seconds INTEGER,\
+                updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP\
+            )",
+            "CREATE TABLE IF NOT EXISTS track_album (\
+                track_id     TEXT NOT NULL REFERENCES track(id),\
+                album_id     TEXT NOT NULL REFERENCES album(id),\
+                track_number INTEGER,\
+                PRIMARY KEY (track_id, album_id)\
+            )",
+            "CREATE TABLE IF NOT EXISTS track_artist (\
+                track_id  TEXT NOT NULL REFERENCES track(id),\
+                artist_id TEXT NOT NULL REFERENCES artist(id),\
+                role      TEXT,\
+                PRIMARY KEY (track_id, artist_id, role)\
+            )",
+            "CREATE TABLE IF NOT EXISTS artist_instrument (\
+                artist_id     TEXT NOT NULL REFERENCES artist(id),\
+                instrument_id TEXT NOT NULL,\
+                PRIMARY KEY (artist_id, instrument_id)\
+            )",
+            "CREATE TABLE IF NOT EXISTS artist_member_of (\
+                artist_id TEXT NOT NULL REFERENCES artist(id),\
+                group_id  TEXT NOT NULL REFERENCES artist(id),\
+                PRIMARY KEY (artist_id, group_id)\
+            )",
+            "CREATE TABLE IF NOT EXISTS sync_state (\
+                key   TEXT PRIMARY KEY,\
+                value TEXT NOT NULL\
+            )",
+        ];
+
+        for stmt in &v1_statements {
+            conn.execute_batch(stmt).unwrap();
+        }
+
+        // Seed version 1 (as a v1 database would have)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (1)",
+            [],
+        )
+        .unwrap();
+
+        // Verify v1 schema (new tables should not exist)
+        for table in &["qid_label", "instrument", "record_label"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM information_schema.tables \
+                     WHERE table_name = ?1 AND table_schema = 'main'",
+                    duckdb::params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "Table {} should NOT exist in v1", table);
+        }
+
+        // Now initialize with the v2 schema
+        initialize(&conn).unwrap();
+
+        // Verify MAX returns 2
+        let version: i32 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 2, "MAX(version) should return 2 after migration");
+
+        // Verify new tables exist after migration
+        for table in &["qid_label", "instrument", "record_label"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM information_schema.tables \
+                     WHERE table_name = ?1 AND table_schema = 'main'",
+                    duckdb::params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "Table {} should exist after v1→v2 migration",
+                table
+            );
+        }
+
+        // Verify old tables still exist
+        assert!(all_tables_exist(&conn).unwrap());
+    }
+
+    #[test]
+    fn test_all_tables_exist_includes_new() {
+        let conn = test_conn().unwrap();
+        // Without initialization, all_tables_exist should be false
+        assert!(!all_tables_exist(&conn).unwrap());
+
+        initialize(&conn).unwrap();
+        assert!(all_tables_exist(&conn).unwrap());
+
+        // Verify each new table individually
+        for table in &["qid_label", "instrument", "record_label"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM information_schema.tables \
+                     WHERE table_name = ?1 AND table_schema = 'main'",
+                    duckdb::params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "Table {} should be detected by all_tables_exist",
+                table
+            );
+        }
+    }
+
+    #[test]
+    fn test_qid_label_table_insert() {
+        let conn = test_conn().unwrap();
+        initialize(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO qid_label (qid, label, description) VALUES (?1, ?2, ?3)",
+            duckdb::params!["Q2831", "Ivy Queen", "American singer-songwriter"],
+        )
+        .unwrap();
+
+        let label: Option<String> = conn
+            .query_row(
+                "SELECT label FROM qid_label WHERE qid = 'Q2831'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(label.as_deref(), Some("Ivy Queen"));
+    }
+
+    #[test]
+    fn test_instrument_table_insert() {
+        let conn = test_conn().unwrap();
+        initialize(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO instrument (id, name) VALUES (?1, ?2)",
+            duckdb::params!["Q171", "guitar"],
+        )
+        .unwrap();
+
+        let name: String = conn
+            .query_row("SELECT name FROM instrument WHERE id = 'Q171'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "guitar");
+    }
+
+    #[test]
+    fn test_record_label_table_insert() {
+        let conn = test_conn().unwrap();
+        initialize(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO record_label (id, name) VALUES (?1, ?2)",
+            duckdb::params!["Q12345", "Columbia Records"],
+        )
+        .unwrap();
+
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM record_label WHERE id = 'Q12345'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "Columbia Records");
     }
 
     // -----------------------------------------------------------------------
