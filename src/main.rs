@@ -74,6 +74,7 @@ fn main() -> Result<()> {
         Command::Bootstrap(args) => cmd_bootstrap(args, config.as_ref()),
         Command::Update(args) => cmd_update(args, config.as_ref()),
         Command::Query(args) => cmd_query(args, config.as_ref()),
+        Command::Populate(args) => cli::populate::cmd_populate(args, config.as_ref()),
         Command::Completion(args) => cmd_completion(args, &cli),
     }
 }

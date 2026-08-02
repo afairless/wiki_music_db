@@ -1,5 +1,6 @@
 pub mod bootstrap;
 pub mod download;
+pub mod populate;
 pub mod query;
 pub mod update;
 
@@ -54,6 +55,9 @@ pub enum Command {
 
     /// Generate shell completion scripts.
     Completion(CompletionArgs),
+
+    /// Populate name, date, and label columns from the Wikidata dump.
+    Populate(populate::PopulateArgs),
 }
 
 /// Arguments for the `completion` subcommand.
