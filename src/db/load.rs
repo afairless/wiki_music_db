@@ -671,6 +671,20 @@ fn upsert_entity_inner(conn: &Connection, entity: &MusicEntity) -> Result<()> {
     )
     .with_context(|| format!("Failed to upsert artist {}", entity.id))?;
 
+    // 1b. Upsert into qid_label if the entity has an English label
+    //     This ensures the qid_label table is populated for newly-fetched
+    //     entities during incremental updates, so album/track stub names
+    //     can be resolved via COALESCE lookups below.
+    if let Some(ref name) = entity.name {
+        let description = entity.description.as_deref();
+        conn.execute(
+            "INSERT OR IGNORE INTO qid_label (qid, label, description) \
+             VALUES (?1, ?2, ?3)",
+            duckdb::params![entity.id, name, description],
+        )
+        .with_context(|| format!("Failed to upsert qid_label for {}", entity.id))?;
+    }
+
     // 2. Upsert genres with placeholder names if needed
     for genre_qid in &entity.genres {
         conn.execute(
@@ -725,8 +739,9 @@ fn upsert_entity_inner(conn: &Connection, entity: &MusicEntity) -> Result<()> {
     // 6. Upsert albums and album_artist
     for album_ref in &entity.albums {
         conn.execute(
-            "INSERT OR REPLACE INTO album (id, name) VALUES (?1, ?2)",
-            duckdb::params![album_ref.album_id, album_ref.album_id],
+            "INSERT OR REPLACE INTO album (id, name) \
+             VALUES (?1, COALESCE((SELECT label FROM qid_label WHERE qid = ?1), ?1))",
+            duckdb::params![album_ref.album_id],
         )
         .with_context(|| {
             format!(
@@ -750,8 +765,9 @@ fn upsert_entity_inner(conn: &Connection, entity: &MusicEntity) -> Result<()> {
     // 7. Upsert tracks and track_artist
     for track_ref in &entity.tracks {
         conn.execute(
-            "INSERT OR REPLACE INTO track (id, name) VALUES (?1, ?2)",
-            duckdb::params![track_ref.track_id, track_ref.track_id],
+            "INSERT OR REPLACE INTO track (id, name) \
+             VALUES (?1, COALESCE((SELECT label FROM qid_label WHERE qid = ?1), ?1))",
+            duckdb::params![track_ref.track_id],
         )
         .with_context(|| {
             format!(
@@ -1861,6 +1877,160 @@ mod tests {
             })
             .unwrap();
         assert_eq!(name.as_deref(), Some("JSON Upsert Artist"));
+    }
+
+    #[test]
+    fn test_upsert_updates_qid_label() {
+        let conn = test_conn();
+
+        let entity = MusicEntity {
+            id: "Q99996".to_string(),
+            name: Some("Artist With Label".to_string()),
+            description: Some("A test description".to_string()),
+            artist_type: "person".to_string(),
+            inclusion_reason: "P106:Q639669".to_string(),
+            birth_date: None,
+            death_date: None,
+            genres: vec![],
+            instruments: vec![],
+            member_of: vec![],
+            albums: vec![],
+            tracks: vec![],
+        };
+
+        upsert_entity(&conn, &entity).unwrap();
+
+        // Verify qid_label was populated
+        let (label, description): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT label, description FROM qid_label WHERE qid = 'Q99996'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(label.as_deref(), Some("Artist With Label"));
+        assert_eq!(description.as_deref(), Some("A test description"));
+    }
+
+    #[test]
+    fn test_upsert_updates_qid_label_no_name() {
+        let conn = test_conn();
+
+        // Entity with no English label should NOT create a qid_label entry
+        let entity = MusicEntity {
+            id: "Q99997".to_string(),
+            name: None,
+            description: None,
+            artist_type: "person".to_string(),
+            inclusion_reason: "P106:Q639669".to_string(),
+            birth_date: None,
+            death_date: None,
+            genres: vec![],
+            instruments: vec![],
+            member_of: vec![],
+            albums: vec![],
+            tracks: vec![],
+        };
+
+        upsert_entity(&conn, &entity).unwrap();
+
+        let count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM qid_label WHERE qid = 'Q99997'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "No qid_label entry should be created for entity without name"
+        );
+    }
+
+    #[test]
+    fn test_upsert_album_with_label_from_qid_label() {
+        let conn = test_conn();
+
+        // Pre-populate qid_label with an album label
+        conn.execute(
+            "INSERT INTO qid_label (qid, label) VALUES ('Q55555', 'Greatest Hits')",
+            [],
+        )
+        .unwrap();
+
+        let entity = MusicEntity {
+            id: "Q99995".to_string(),
+            name: Some("Test Artist".to_string()),
+            description: None,
+            artist_type: "person".to_string(),
+            inclusion_reason: "P106:Q639669".to_string(),
+            birth_date: None,
+            death_date: None,
+            genres: vec![],
+            instruments: vec![],
+            member_of: vec![],
+            albums: vec![crate::extraction::AlbumRef {
+                album_id: "Q55555".to_string(),
+                role: Some("performer".to_string()),
+            }],
+            tracks: vec![],
+        };
+
+        upsert_entity(&conn, &entity).unwrap();
+
+        // Verify album name is resolved from qid_label
+        let album_name: String = conn
+            .query_row("SELECT name FROM album WHERE id = 'Q55555'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            album_name, "Greatest Hits",
+            "Album name should be resolved from qid_label"
+        );
+    }
+
+    #[test]
+    fn test_upsert_track_with_label_from_qid_label() {
+        let conn = test_conn();
+
+        // Pre-populate qid_label with a track label
+        conn.execute(
+            "INSERT INTO qid_label (qid, label) VALUES ('Q66666', 'My Song')",
+            [],
+        )
+        .unwrap();
+
+        let entity = MusicEntity {
+            id: "Q99995".to_string(),
+            name: Some("Test Artist".to_string()),
+            description: None,
+            artist_type: "person".to_string(),
+            inclusion_reason: "P106:Q639669".to_string(),
+            birth_date: None,
+            death_date: None,
+            genres: vec![],
+            instruments: vec![],
+            member_of: vec![],
+            albums: vec![],
+            tracks: vec![crate::extraction::TrackRef {
+                track_id: "Q66666".to_string(),
+                role: Some("performer".to_string()),
+            }],
+        };
+
+        upsert_entity(&conn, &entity).unwrap();
+
+        // Verify track name is resolved from qid_label
+        let track_name: String = conn
+            .query_row("SELECT name FROM track WHERE id = 'Q66666'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            track_name, "My Song",
+            "Track name should be resolved from qid_label"
+        );
     }
 
     #[test]
