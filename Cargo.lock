@@ -2895,6 +2895,7 @@ dependencies = [
 name = "wiki_db"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "arrow 59.1.0",
  "chrono",

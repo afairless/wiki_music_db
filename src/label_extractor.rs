@@ -19,6 +19,7 @@
 //!
 //! All failures are logged at WARN and stored as NULL — never rejected.
 
+use aho_corasick::AhoCorasick;
 use std::collections::HashSet;
 use std::fs;
 use std::io::BufRead;
@@ -177,6 +178,12 @@ pub fn extract_labels_and_claims(
     qid_sets: &mut QidSets,
     parquet_dir: &Path,
 ) -> Result<()> {
+    // Early return if no Q-IDs to match (also skips opening the dump file)
+    if qid_sets.all.is_empty() {
+        tracing::info!("No Q-IDs to match -- skipping label extraction");
+        return Ok(());
+    }
+
     let file = fs::File::open(dump_path)
         .with_context(|| format!("Failed to open dump file: {}", dump_path.display()))?;
     let decoder = MultiGzDecoder::new(file);
@@ -187,6 +194,16 @@ pub fn extract_labels_and_claims(
     // Collect genre entries for genres.parquet
     let mut genre_entries: Vec<GenreEntry> = Vec::new();
     let mut line_number: u64 = 0;
+
+    // Build an Aho-Corasick automaton from all known Q-IDs for O(L) single-pass
+    // substring matching, replacing the O(K × L) HashSet linear scan. Built once
+    // before the loop; never mutated during scanning.
+    let qid_patterns: Vec<&str> = qid_sets.all.iter().map(|s| s.as_str()).collect();
+    let ac = AhoCorasick::new(&qid_patterns).context("Failed to build Aho-Corasick automaton")?;
+    // Q-IDs discovered mid-scan (e.g. P264 record labels) that are not in the
+    // automaton; matched with a linear fallback since this set stays tiny.
+    let mut discovered_qids: HashSet<String> = HashSet::new();
+
     let mut line_buf = String::new();
 
     // Track discovered P264 record label Q-IDs that should be added to the
@@ -214,8 +231,8 @@ pub fn extract_labels_and_claims(
         // Strip trailing comma (Wikidata dump has comma-separated JSON objects)
         let line = trimmed.trim_end_matches(',');
 
-        // Substring pre-check: skip lines that don't contain any target Q-ID
-        if !qid_sets.all.iter().any(|qid| line.contains(qid.as_str())) {
+        // Two-tier pre-check: automaton (bulk) + linear fallback (discovered)
+        if !passes_precheck(line, &ac, &discovered_qids) {
             continue;
         }
 
@@ -270,6 +287,7 @@ pub fn extract_labels_and_claims(
             if let Some(ref rl_qid) = record_label_qid
                 && qid_sets.all.insert(rl_qid.clone())
             {
+                discovered_qids.insert(rl_qid.clone());
                 discovered_label_qids.push(rl_qid.clone());
                 tracing::debug!(
                     entity_id = %entity.id,
@@ -323,6 +341,27 @@ pub fn extract_labels_and_claims(
     );
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pre-check helper
+// ---------------------------------------------------------------------------
+
+/// Two-tier substring pre-check for a dump line.
+///
+/// Returns `true` when the line contains any Q-ID known to the Aho-Corasick
+/// automaton (bulk match, single pass over the text), or any Q-ID in the
+/// dynamically-discovered set (linear fallback over the tiny discovered set).
+///
+/// This avoids deserializing ~99% of dump lines that reference no target
+/// Q-IDs.
+fn passes_precheck(line: &str, ac: &AhoCorasick, discovered_qids: &HashSet<String>) -> bool {
+    if ac.find(line).is_some() {
+        return true;
+    }
+    discovered_qids
+        .iter()
+        .any(|qid| line.contains(qid.as_str()))
 }
 
 // ---------------------------------------------------------------------------
@@ -698,6 +737,7 @@ mod tests {
     use crate::wikidata::model::{
         Claim, DatavalueValue, Descriptions, Entity, Labels, LanguageValue, Mainsnak,
     };
+    use proptest::prop_assert_eq;
     use std::collections::HashMap;
 
     // -------------------------------------------------------------------
@@ -953,60 +993,158 @@ mod tests {
         assert!(qid_sets.tracks.is_empty());
     }
 
+    // -------------------------------------------------------------------
+    // Pre-check helper for tests
+    // -------------------------------------------------------------------
+
+    /// Build an Aho-Corasick automaton from a set of Q-IDs for pre-check tests.
+    fn build_ac(all: &HashSet<String>) -> AhoCorasick {
+        let patterns: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+        AhoCorasick::new(&patterns).unwrap()
+    }
+
     #[test]
     fn test_substring_precheck_match() {
-        let mut all = HashSet::new();
-        all.insert("Q2831".to_string());
-        let qid_sets = QidSets {
-            all,
-            albums: HashSet::new(),
-            tracks: HashSet::new(),
-            artists_with_null_names: HashSet::new(),
-            instruments: HashSet::new(),
-            genres: HashSet::new(),
-        };
+        let all = HashSet::from(["Q2831".to_string()]);
+        let ac = build_ac(&all);
+        let discovered = HashSet::new();
         let line = r#"{"id":"Q2831","type":"item"}"#;
-        let matches = qid_sets.all.iter().any(|qid| line.contains(qid.as_str()));
-        assert!(matches, "Line containing Q2831 should match");
+        assert!(
+            passes_precheck(line, &ac, &discovered),
+            "Line containing Q2831 should match"
+        );
+        assert!(
+            ac.find(line).is_some(),
+            "Aho-Corasick should also find the match"
+        );
     }
 
     #[test]
     fn test_substring_precheck_skip() {
-        let mut all = HashSet::new();
-        all.insert("Q2831".to_string());
-        let qid_sets = QidSets {
-            all,
-            albums: HashSet::new(),
-            tracks: HashSet::new(),
-            artists_with_null_names: HashSet::new(),
-            instruments: HashSet::new(),
-            genres: HashSet::new(),
-        };
+        let all = HashSet::from(["Q2831".to_string()]);
+        let ac = build_ac(&all);
+        let discovered = HashSet::new();
         let line = r#"{"id":"Q42","type":"item"}"#;
-        let matches = qid_sets.all.iter().any(|qid| line.contains(qid.as_str()));
-        assert!(!matches, "Line without Q2831 should not match");
+        assert!(
+            !passes_precheck(line, &ac, &discovered),
+            "Line without Q2831 should not match"
+        );
     }
 
     #[test]
     fn test_substring_precheck_false_positive() {
         // Q2831 is a substring of Q28310, but the full QID comparison
         // should filter correctly during entity processing.
-        let mut all = HashSet::new();
-        all.insert("Q2831".to_string());
-        let qid_sets = QidSets {
-            all,
+        let all = HashSet::from(["Q2831".to_string()]);
+        let ac = build_ac(&all);
+        let discovered = HashSet::new();
+        // This line contains "Q2831" as a substring of "Q28310"
+        let line = r#"{"id":"Q28310","type":"item"}"#;
+        assert!(
+            passes_precheck(line, &ac, &discovered),
+            "Substring check should match false positive"
+        );
+        // But the entity id check should reject it
+        assert!(!all.contains("Q28310"));
+    }
+
+    #[test]
+    fn test_aho_corasick_precheck_match() {
+        let all = HashSet::from(["Q2831".to_string()]);
+        let ac = build_ac(&all);
+        let discovered = HashSet::new();
+        let line = r#"{"id":"Q2831","type":"item"}"#;
+        assert!(passes_precheck(line, &ac, &discovered));
+    }
+
+    #[test]
+    fn test_aho_corasick_precheck_skip() {
+        let all = HashSet::from(["Q2831".to_string()]);
+        let ac = build_ac(&all);
+        let discovered = HashSet::new();
+        let line = r#"{"id":"Q42","type":"item"}"#;
+        assert!(!passes_precheck(line, &ac, &discovered));
+    }
+
+    #[test]
+    fn test_aho_corasick_precheck_false_positive() {
+        let all = HashSet::from(["Q2831".to_string()]);
+        let ac = build_ac(&all);
+        let discovered = HashSet::new();
+        // "Q2831" is a substring of "Q28310" — passes the automaton pre-check
+        let line = r#"{"id":"Q28310","type":"item"}"#;
+        assert!(
+            passes_precheck(line, &ac, &discovered),
+            "False positive at pre-check is expected"
+        );
+        // But the full entity Q-ID check (not tested here) correctly rejects Q28310
+    }
+
+    #[test]
+    fn test_aho_corasick_many_patterns() {
+        let all: HashSet<String> = (0..10_000).map(|i| format!("Q{}", i)).collect();
+        let ac = build_ac(&all);
+        let discovered = HashSet::new();
+        // A line containing one of the 10K patterns matches
+        let line = r#"{"id":"Q9999","type":"item"}"#;
+        assert!(passes_precheck(line, &ac, &discovered));
+        // A line without any pattern does not match
+        let line2 = "{\"id\":\"X200000\",\"type\":\"item\"}";
+        assert!(!passes_precheck(line2, &ac, &discovered));
+    }
+
+    #[test]
+    fn test_empty_qid_set_returns_early() {
+        // An empty set should cause extract_labels_and_claims to return early
+        // without opening the dump file. Use a nonexistent path to verify.
+        let mut all = QidSets {
+            all: HashSet::new(),
             albums: HashSet::new(),
             tracks: HashSet::new(),
             artists_with_null_names: HashSet::new(),
             instruments: HashSet::new(),
             genres: HashSet::new(),
         };
-        // This line contains "Q2831" as a substring of "Q28310"
-        let line = r#"{"id":"Q28310","type":"item"}"#;
-        let matches = qid_sets.all.iter().any(|qid| line.contains(qid.as_str()));
-        assert!(matches, "Substring check should match false positive");
-        // But the entity id check should reject it
-        assert!(!qid_sets.all.contains("Q28310"));
+        let result = extract_labels_and_claims(
+            Path::new("/nonexistent/dump.json.gz"),
+            &mut all,
+            Path::new("/tmp"),
+        );
+        assert!(result.is_ok(), "Empty Q-ID set should return Ok(()) early");
+    }
+
+    #[test]
+    fn test_discovered_qids_fallback() {
+        // Build an automaton with a dummy pattern that won't match our test line
+        let ac = AhoCorasick::new(["ZZZZ-NO-MATCH-ZZZZ"]).unwrap();
+        let mut discovered: HashSet<String> = HashSet::new();
+        let line = r#"{"id":"Q12345","type":"item"}"#;
+        // No match initially
+        assert!(!passes_precheck(line, &ac, &discovered));
+        // After adding to discovered set mid-scan, the linear fallback matches
+        discovered.insert("Q12345".to_string());
+        assert!(passes_precheck(line, &ac, &discovered));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_aho_corasick_equivalent_to_hashset_contains(
+            qids in proptest::collection::vec("[Q][0-9]{1,4}", 0..20),
+            line in ".*"
+        ) {
+            let set: HashSet<String> = qids.iter().cloned().collect();
+            let ac = if set.is_empty() {
+                AhoCorasick::new(["ZZZZ-NO-MATCH-ZZZZ"]).unwrap()
+            } else {
+                let patterns: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
+                AhoCorasick::new(&patterns).unwrap()
+            };
+            let discovered = HashSet::new();
+            let automaton_matches = passes_precheck(&line, &ac, &discovered);
+            let hashset_matches = set.iter().any(|qid| line.contains(qid.as_str()));
+            prop_assert_eq!(automaton_matches, hashset_matches,
+                "Aho-Corasick and HashSet must agree on all lines");
+        }
     }
 
     // -------------------------------------------------------------------
