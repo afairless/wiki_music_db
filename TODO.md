@@ -14,243 +14,119 @@ This plan builds on the existing wiki_db pipeline (Phases 1–8 completed). The 
 | 4 | `feat(cli): add populate subcommand for name/date/label backfill` | CLI subcommand | `src/cli/populate.rs` — `populate` subcommand with `--force`, `--resume`; `src/cli/mod.rs` — register; `src/main.rs` — wire | Unit, integration |
 | 5 | `feat(update): fetch labels for new entities during incremental update` | Update pipeline | `src/sparql.rs` — extend `fetch_entity` response; `src/db/load.rs` — upsert labels; `src/cli/update.rs` — wire label resolution | Unit |
 
+---
+
+# Populate Substring Pre-Check Performance Optimization
+
+Source: `docs/research/2026-08_populate_performance_optimization.md`
+
+## Context
+
+The `populate` subcommand's `extract_labels_and_claims()` in `src/label_extractor.rs` has a severe performance bottleneck. The substring pre-check iterates through every Q-ID in a ~2.6M-element HashSet and performs a `String::contains()` scan for each one, achieving only ~13 KB/s throughput — projecting a **~134 day runtime** for the full 155 GB dump.
+
+This plan replaces the O(K × L) pre-check with an **Aho-Corasick automaton** that finds all pattern matches in a single pass over the text, regardless of the number of patterns. Expected speedup: **1,500–3,700×** (from 134 days to ~25–35 minutes).
+
+| # | Commit message | Logical unit | Key deliverables | Tests |
+|---|---|---|---|---|
+| 1 | `build(deps): add aho-corasick for multi-pattern substring matching` | Dependency | `Cargo.toml` — add `aho-corasick = "1"` | — |
+| 2 | `perf(label_extractor): replace O(n) substring scan with Aho-Corasick automaton` | Pre-check optimization | `src/label_extractor.rs` — automaton build, two-tier filter (automaton + discovered_qids fallback), P264 insertion site update | Unit, property-based |
+
 ## Step details
 
-### Step 1 — `feat(db): add qid_label, instrument, and record_label tables`
+### Step 1 — `build(deps): add aho-corasick for multi-pattern substring matching`
 
-**Rationale:** The new tables store resolved English labels, instrument names, and record label names. They are referenced by the backfill UPDATEs in Step 3.
-
-**Deliverables:**
-
-- `src/db/schema.rs`:
-  - Add `CREATE TABLE IF NOT EXISTS qid_label (qid TEXT PRIMARY KEY, label TEXT, description TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`
-  - Add `CREATE TABLE IF NOT EXISTS instrument (id TEXT PRIMARY KEY, name TEXT NOT NULL)`
-  - Add `CREATE TABLE IF NOT EXISTS record_label (id TEXT PRIMARY KEY, name TEXT NOT NULL)`
-  - Bump `SCHEMA_VERSION` from 1 to 2
-  - The `initialize()` function is already idempotent — calling it on a v1 database adds the new tables. The `schema_version()` function returns `MAX(version)`, so it correctly reports 2 after migration. No explicit UPDATE of the version row is needed.
-  - Update `all_tables_exist()` to include the new table names
-  - Update any existing tests that assert SCHEMA_VERSION
-
-- **Migration strategy:** `populate` subcommand (Step 4) is the migration mechanism. No separate migration scripts.
-
-- **Tests:**
-  - `test_initialize_creates_new_tables` — verify `qid_label`, `instrument`, `record_label` exist after initialize
-  - `test_schema_version_bumped` — verify SCHEMA_VERSION is 2
-  - `test_v1_migration_path` — insert version 1, re-initialize, verify version 2 is returned (MAX)
-  - `test_all_tables_exist_includes_new` — verify all_tables_exist succeeds with new tables
-
-### Step 2 — `feat: implement Q-ID label and claims extraction from Wikidata dump`
-
-**Rationale:** A new module `src/label_extractor.rs` that collects all referenced Q-IDs from the existing database, then streams the Wikidata dump to extract labels and claims, writing them to intermediate Parquet files.
+**Rationale:** The `aho-corasick` crate provides the multi-pattern string matching automaton needed to replace the O(K × L) `HashSet::iter().any()` pre-check loop.
 
 **Deliverables:**
 
-- `src/label_extractor.rs` — new module with:
-  - `collect_qid_set(conn)` — queries the DuckDB database for all referenced Q-IDs:
-    - `SELECT DISTINCT id FROM album`
-    - `SELECT DISTINCT id FROM track`
-    - `SELECT DISTINCT id FROM artist WHERE name IS NULL OR name = id`
-    - `SELECT DISTINCT instrument_id FROM artist_instrument`
-    - Adds album and track Q-IDs for album_genre and track_album extraction
-    - Unions and deduplicates into a `HashSet<String>`
-  - `extract_labels_and_claims(dump_path, qid_set, parquet_dir)` — stream the dump, extracting for any Q-ID in the set:
-    - `(qid, en_label, en_description)` → `labels.parquet`
-    - `(entity_qid, entity_type, release_date, record_label_qid, duration_seconds, genre_qid, parent_album_qid)` → `enrichment.parquet`
-  - During the scan, dynamically adds any P264 record-label Q-IDs discovered on album entities to the match set (so label entities encountered later in the dump get their labels extracted)
-  - Substring pre-check: `line.contains(qid)` check on the raw JSON line to avoid deserializing ~99% of the dump
-  - Claims extraction:
-    - `P577` (publication date) — parsed to DATE. Full precision (11) → normal parse. Year-only (9) → `YYYY-01-01`, logged at DEBUG. Coarser precisions → NULL, logged at WARN.
-    - `P264` (record label) — Q-ID of the record label entity
-    - `P2047` (duration) — parsed to INTEGER seconds
-    - `P136` on album entities → `(album_id, genre_id)` pairs
-    - `P361` on track entities → `(track_id, album_id)` pairs
-  - Writes results to Parquet files using the same `ArrowWriter`/`WriterProperties` infrastructure as `MusicEntityBatchWriter`
+- `Cargo.toml`:
+  - Add `aho-corasick = "1"` to `[dependencies]`
 
-- **Parquet schemas:**
+**Tests:** None — purely a build configuration change.
 
-  `labels.parquet`:
+---
 
-  | Column | Type | Nullable |
-  |--------|------|----------|
-  | `qid` | TEXT | No |
-  | `label` | TEXT | Yes |
-  | `description` | TEXT | Yes |
+### Step 2 — `perf(label_extractor): replace O(n) substring scan with Aho-Corasick automaton`
 
-  `enrichment.parquet`:
-
-  | Column | Type | Nullable |
-  |--------|------|----------|
-  | `entity_qid` | TEXT | No |
-  | `entity_type` | TEXT | No |
-  | `release_date` | TEXT | Yes |
-  | `record_label_qid` | TEXT | Yes |
-  | `duration_seconds` | TEXT | Yes |
-  | `genre_qid` | TEXT | Yes |
-  | `parent_album_qid` | TEXT | Yes |
-
-- **Data contracts:**
-  - Labels must be non-empty UTF-8 strings; empty labels stored as NULL
-  - Dates parsed via Wikidata format; unparseable dates logged at WARN, stored as NULL
-  - Durations parsed to INTEGER seconds; unparseable values logged at WARN, stored as NULL
-  - Q-IDs without English labels or claims silently omitted from output
-
-- **Tests (unit):**
-  - `test_extract_label_valid` — entity with English label
-  - `test_extract_label_no_en` — entity without English label → NULL
-  - `test_extract_label_empty` — entity with empty English label → NULL
-  - `test_extract_claim_p577` — entity with P577 date → parsed
-  - `test_extract_claim_p577_precision_9` — year-only precision
-  - `test_extract_claim_p577_precision_8` — decade precision → NULL
-  - `test_extract_claim_p577_invalid` — unparseable → NULL
-  - `test_extract_claim_p264` — record label Q-ID
-  - `test_extract_claim_p2047` — duration in seconds
-  - `test_extract_claim_p2047_invalid` — unparseable → NULL
-  - `test_extract_album_genre` — P136 on album entity
-  - `test_extract_track_album` — P361 on track entity
-  - `test_qid_set_collection` — DB Q-ID collection produces correct union
-  - `test_qid_set_collection_empty_db` — empty DB returns empty set
-  - `test_substring_precheck_match` — line containing Q-ID is not skipped
-  - `test_substring_precheck_skip` — line without target Q-ID is skipped
-  - `test_substring_precheck_false_positive` — substring match still filters correctly
-
-- **Tests (property-based):**
-  - `test_roundtrip_labels_parquet` — write labels → read back → match
-  - `test_roundtrip_enrichment_parquet` — write enrichment → read back → match
-
-### Step 3 — `feat(db): add label and enrichment Parquet loader with backfill`
-
-**Rationale:** Load the Parquet files produced by Step 2 into the DuckDB tables and backfill the existing columns. All backfill UPDATEs are wrapped in a single transaction. This step also removes the deprecated `extract_genre_labels()` function and its call site in `cmd_bootstrap`, since the new label extraction replaces it.
+**Rationale:** Replace the per-line `HashSet::iter().any(|qid| line.contains(qid))` loop (O(K × L) where K ≈ 2.6M) with a two-tier filter: an Aho-Corasick automaton for the bulk Q-IDs (O(L) single pass), plus a linear fallback over dynamically discovered Q-IDs (tiny set, typically hundreds).
 
 **Deliverables:**
 
-- `src/db/load.rs`:
-  - Add `load_labels(conn, parquet_dir)` — load `labels.parquet` → `qid_label` via `INSERT OR IGNORE`
-  - Add `load_enrichment(conn, parquet_dir)` — load `enrichment.parquet`:
-    - `INSERT OR IGNORE INTO instrument (id, name)` — from enrichment, joining with `qid_label`
-    - `INSERT OR IGNORE INTO record_label (id, name)` — from enrichment, joining with `qid_label`
-    - `INSERT OR IGNORE INTO album_genre (album_id, genre_id)` — from enrichment `genre_qid` rows
-    - `INSERT OR IGNORE INTO track_album (track_id, album_id)` — from enrichment `parent_album_qid` rows
-  - Add `backfill_names(conn)` — single transaction wrapping all UPDATEs:
-    - `UPDATE album SET name = COALESCE((SELECT label FROM qid_label WHERE qid = album.id), album.name)`
-    - `UPDATE track SET name = COALESCE((SELECT label FROM qid_label WHERE qid = track.id), track.name)`
-    - `UPDATE artist SET name = COALESCE((SELECT label FROM qid_label WHERE qid = artist.id), artist.name) WHERE name IS NULL OR name = id`
-    - `UPDATE album SET release_date = ...` — from enrichment
-    - `UPDATE album SET record_label = ...` — from enrichment (resolved via qid_label)
-    - `UPDATE track SET duration_seconds = ...` — from enrichment
-  - After backfill, recreate FTS indexes via `create_fts_indexes()` (idempotent)
-  - Add `load_label_and_enrichment(conn, parquet_dir)` — orchestrator for the full load pipeline
+- `src/label_extractor.rs`:
+  1. Add `use aho_corasick::AhoCorasick;` to the top-level imports.
+  2. Add early return guard at the top of `extract_labels_and_claims()`:
 
-- `src/main.rs` — `cmd_bootstrap()`:
-  - Remove the `extract_genre_labels()` call and the second-pass genre extraction block
-  - Remove the `write_genres_parquet()` call for the second pass
-  - The genre label extraction is now handled by the `populate` subcommand (Step 4)
+     ```rust
+     if qid_sets.all.is_empty() {
+         tracing::info!("No Q-IDs to match — skipping label extraction");
+         return Ok(());
+     }
+     ```
 
-- `src/extraction.rs`:
-  - Remove `extract_genre_labels()`, `extract_genre_entity()`, `collect_genre_qids()`, `collect_all_genre_qids()`, `GenreEntry` struct
-  - Keep `extract_music_entity()` and all other types/functions (they remain in use)
+  3. Build the automaton once from all Q-IDs:
 
-- `src/parquet_writer.rs`:
-  - Keep `write_genres_parquet()` — it's still used during the main streaming pass for the genre table. Only the second-pass `extract_genre_labels()` call is removed.
+     ```rust
+     let qid_patterns: Vec<&str> = qid_sets.all.iter().map(|s| s.as_str()).collect();
+     let ac = AhoCorasick::new(&qid_patterns);
+     let mut discovered_qids: HashSet<String> = HashSet::new();
+     ```
 
-- **Tests (integration):**
-  - `test_load_labels_parquet` — write labels.parquet → load → verify qid_label table
-  - `test_load_enrichment_parquet` — write enrichment.parquet → load → verify instrument, record_label, album_genre, track_album
-  - `test_backfill_album_names` — album with QID placeholder → updated to English label
-  - `test_backfill_track_names` — track with QID placeholder → updated to English label
-  - `test_backfill_artist_names` — artist with NULL/QID name → updated to English label
-  - `test_backfill_preserves_existing` — artist with real name left unchanged
-  - `test_backfill_missing_label` — QID without English label keeps Q-ID placeholder
-  - `test_backfill_transaction_rollback` — corrupt Parquet row → mid-load failure → database unchanged
-  - `test_fts_after_backfill` — search for resolved name after backfill returns correct result
-  - `test_backfill_idempotent` — run twice → identical state
+  4. Replace the substring pre-check with a two-tier filter:
 
-### Step 4 — `feat(cli): add populate subcommand for name/date/label backfill`
+     ```rust
+     // Before:
+     if !qid_sets.all.iter().any(|qid| line.contains(qid.as_str())) {
+         continue;
+     }
+     // After:
+     if ac.find(&line).is_none()
+         && !discovered_qids.iter().any(|qid| line.contains(qid.as_str()))
+     {
+         continue;
+     }
+     ```
 
-**Rationale:** A new `populate` subcommand that runs the label extractor → Parquet writer → DuckDB loader → backfill pipeline. Separate from `bootstrap` — users run `populate` after `bootstrap` to resolve names.
+  5. Update the P264 dynamic-insertion site to also insert into `discovered_qids`:
 
-**Deliverables:**
+     ```rust
+     // Before:
+     if let Some(ref rl_qid) = record_label_qid
+         && qid_sets.all.insert(rl_qid.clone())
+     {
+         discovered_label_qids.push(rl_qid.clone());
+     }
+     // After:
+     if let Some(ref rl_qid) = record_label_qid
+         && qid_sets.all.insert(rl_qid.clone())
+     {
+         discovered_qids.insert(rl_qid.clone());
+         discovered_label_qids.push(rl_qid.clone());
+     }
+     ```
 
-- `src/cli/populate.rs` — new module:
+- **Tests (unit in `src/label_extractor.rs`):**
+  - `test_aho_corasick_precheck_match` — Line containing a Q-ID is matched by the automaton
+  - `test_aho_corasick_precheck_skip` — Line without any Q-ID is correctly skipped
+  - `test_aho_corasick_precheck_false_positive` — Substring false positive (e.g., Q2831 in Q28310) passes pre-check but is correctly filtered by full Q-ID comparison
+  - `test_aho_corasick_many_patterns` — Building from 10K+ Q-IDs works correctly and finds matches
+  - `test_empty_qid_set_returns_early` — Calling with an empty `qid_sets.all` returns `Ok(())` without error
+  - `test_discovered_qids_fallback` — A Q-ID added to `discovered_qids` mid-scan matches a line via the linear fallback
+  - `test_aho_corasick_equivalent_to_hashset_contains` — Property-based test with random Q-ID sets and random lines, verifying automaton matches exactly the same lines as the original `HashSet::iter().any()` approach
 
-  ```rust
-  #[derive(Parser, Debug)]
-  pub struct PopulateArgs {
-      /// Path to the Wikidata JSON dump (gzipped).
-      #[arg(long, short)]
-      pub dump: Option<String>,
+- **Test updates:**
+  - Update existing `test_substring_precheck_match`, `test_substring_precheck_skip`, `test_substring_precheck_false_positive` to exercise the Aho-Corasick path via a helper function
 
-      /// Path to the DuckDB database file.
-      #[arg(long)]
-      pub db: Option<String>,
+---
 
-      /// Directory for intermediate Parquet files.
-      #[arg(long)]
-      pub parquet_dir: Option<String>,
+### Step 3 — Integration validation
 
-      /// Force re-populate even if names are already resolved.
-      #[arg(long)]
-      pub force: bool,
-
-      /// Skip extraction if Parquet files already exist.
-      #[arg(long)]
-      pub resume: bool,
-  }
-  ```
-
-- `src/cli/mod.rs`:
-  - Add `Populate(PopulateArgs)` variant to `Command` enum
-  - Add `pub mod populate;`
-
-- `src/main.rs`:
-  - Add `Command::Populate(args) => cmd_populate(args, config.as_ref())` dispatch
-  - Implement `cmd_populate()`:
-    1. Check schema version — if already v2 and all names resolved, skip (unless `--force`)
-    2. Collect Q-ID set from database
-    3. Check for existing Parquet files (resume support)
-    4. Stream dump for label + claims extraction (Step 2)
-    5. Load Parquet + backfill (Step 3)
-    6. Cleanup Parquet files (optional)
-    7. Print summary
-
-- **Tests (unit):**
-  - `test_populate_subcommand_parses` — basic CLI parsing
-  - `test_populate_force_flag` — `--force` parsed correctly
-  - `test_populate_resume_flag` — `--resume` parsed correctly
-
-- **Tests (integration in `tests/populate_test.rs`):**
-  - `test_populate_full_pipeline` — create DB with known Q-IDs → run populate → verify names resolved
-  - `test_populate_idempotent` — run populate twice → identical state
-  - `test_populate_preserves_existing` — doesn't overwrite already-populated names
-  - `test_populate_missing_label` — Q-IDs without English labels keep Q-ID placeholder
-  - `test_populate_transaction_rollback` — corrupt Parquet → mid-load failure → DB unchanged
-  - `test_populate_fts_after_backfill` — search for resolved name via FTS
-
-- **Test fixtures (in `tests/fixtures/`):**
-  - `album_entity.json` — album entity with en label, P577 date, P264 label, P136 genre
-  - `album_entity_year_only.json` — album entity with P577 year-only precision
-  - `track_entity.json` — track entity with en label, P2047 duration, P361 part-of
-  - `mini_dump_with_labels.json.gz` — small gzipped dump with artist + album + track entities
-
-### Step 5 — `feat(update): fetch labels for new entities during incremental update`
-
-**Rationale:** When new entities are added during incremental updates, their names are Q-ID placeholders. The update pipeline should also fetch English labels for these new entities and store them in `qid_label`.
+**Rationale:** Run the full test suite and linters to confirm the optimization preserves correctness. No code changes.
 
 **Deliverables:**
 
-- `src/sparql.rs`:
-  - Extend the entity fetch response to include the English label (already available in the REST API response's `labels` field)
-  - No changes needed if the existing `Entity` model already captures labels
+- `cargo test` — all existing tests pass without modification
+- `cargo clippy -- -D warnings` — no warnings
+- `cargo fmt --check` — formatting is clean
+- `cargo audit` — no known vulnerabilities
 
-- `src/db/load.rs`:
-  - Modify `upsert_entity_inner()` to also upsert into `qid_label` when the entity has an English label:
-    - `INSERT OR IGNORE INTO qid_label (qid, label, description) VALUES (?1, ?2, ?3)`
-  - When inserting album/track stubs during incremental update, use the English label from `qid_label` if available (instead of the Q-ID placeholder)
-
-- `src/main.rs` — `cmd_update()`:
-  - After the SPARQL fetch resolves entity data, extract the English label and store it in `qid_label`
-  - This integrates naturally with the existing `upsert_entity_from_json()` flow
-
-- **Tests (unit):**
-  - `test_upsert_updates_qid_label` — upserting an entity with English label populates `qid_label`
-  - `test_upsert_album_with_label` — album upsert uses English label from qid_label
-  - `test_upsert_track_with_label` — track upsert uses English label from qid_label
+**Commit:** None — verification step only.
