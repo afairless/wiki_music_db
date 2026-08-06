@@ -186,7 +186,8 @@ pub fn load_enrichment(
          SELECT DISTINCT e.entity_qid, e.genre_qid
          FROM read_parquet('{path_str}') e
          WHERE e.entity_type = 'album'
-           AND e.genre_qid IS NOT NULL"
+           AND e.genre_qid IS NOT NULL
+           AND e.genre_qid IN (SELECT id FROM genre)"
     );
     conn.execute(&album_genre_sql, [])
         .context("Failed to load album_genre from enrichment")?;
