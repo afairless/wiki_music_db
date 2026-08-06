@@ -235,6 +235,18 @@ pub fn backfill_names(conn: &Connection, parquet_dir: &Path) -> Result<()> {
         .to_str()
         .context("Enrichment parquet path contains invalid UTF-8")?;
 
+    // Disable FK enforcement during backfill.
+    //
+    // DuckDB applies RESTRICT semantics to ALL parent-table UPDATEs,
+    // not just PK column updates. Since the backfill only touches
+    // non-key columns (name, release_date, record_label, duration_seconds),
+    // disabling FK enforcement is safe — no referential integrity can
+    // be violated.
+    //
+    // See docs/research/2026-08_fix_backfill_album_name_fk_violation.md
+    conn.execute("PRAGMA foreign_keys = OFF", [])
+        .context("Failed to disable FK enforcement")?;
+
     conn.execute("BEGIN TRANSACTION", [])
         .context("Failed to begin backfill transaction")?;
 
@@ -245,11 +257,26 @@ pub fn backfill_names(conn: &Connection, parquet_dir: &Path) -> Result<()> {
             conn.execute("COMMIT", [])
                 .context("Failed to commit backfill transaction")?;
             tracing::info!("Backfill committed successfully");
+
+            // Re-enable FK enforcement
+            conn.execute("PRAGMA foreign_keys = ON", [])
+                .context("Failed to re-enable FK enforcement")?;
             Ok(())
         }
         Err(e) => {
-            conn.execute("ROLLBACK", [])
-                .context("Failed to roll back backfill transaction")?;
+            // Roll back first, then re-enable FK enforcement
+            if let Err(rollback_err) = conn.execute("ROLLBACK", []) {
+                tracing::error!(
+                    error = %rollback_err,
+                    "Failed to roll back backfill transaction"
+                );
+            }
+            if let Err(pragma_err) = conn.execute("PRAGMA foreign_keys = ON", []) {
+                tracing::error!(
+                    error = %pragma_err,
+                    "Failed to re-enable FK enforcement during rollback"
+                );
+            }
             tracing::warn!(error = %e, "Rolled back backfill due to error");
             Err(e)
         }
