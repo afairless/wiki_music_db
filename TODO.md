@@ -1,71 +1,52 @@
-# Implementation Plan: Fix FK Constraint Violations in Enrichment Loading
+# Implementation Plan: Fix Missing FK Guards for album_id and track_id
 
-Source: `docs/research/2026-08_fix_enrichment_fk_constraints.md`
+Source: `docs/research/2026-08_fix_enrichment_fk_album_track_guards.md`
 
 ## Context
 
-The `populate` subcommand's `load_enrichment()` function in `src/db/load.rs` fails with foreign key constraint violations when loading into `album_genre` and `track_album` junction tables. The `album_genre` insert lacks a `WHERE genre_qid IN (SELECT id FROM genre)` FK guard, and `track_album` lacks a `WHERE parent_album_qid IN (SELECT id FROM album)` FK guard. Both are needed because enrichment data references genres/albums that may not exist in the database.
+The prior FK fix (commits 0f67175..ea66274) added guards for `genre_id` in `album_genre` and
+`parent_album_qid` in `track_album`, but missed two other FK columns:
 
-The fix is purely additive SQL — two `AND ... IN (SELECT ...)` clauses following the established pattern in `load_artist_genre()` and `load_artist_member_of()`.
+1. `album_genre.album_id → album(id)` — entity_qid is never checked against the album table
+2. `track_album.track_id → track(id)` — entity_qid is never checked against the track table
+
+When `--resume` reuses stale `enrichment.parquet` files from a different database state, these
+missing guards cause hard `Constraint Error` crashes. DuckDB's `INSERT OR IGNORE` does not
+suppress FK violations.
+
+The fix is purely additive — two `AND entity_qid IN (SELECT id FROM ...)` clauses following
+the established pattern in `load_artist_genre()` and `load_artist_member_of()`.
 
 | # | Commit message | Logical unit | Key deliverables | Tests |
 |---|---|---|---|---|
-| 1 | `fix(db): guard album_genre FK constraint in enrichment loader` | FK guard — album_genre | `src/db/load.rs` — add `AND e.genre_qid IN (SELECT id FROM genre)` to `album_genre_sql` | — |
-| 2 | `fix(db): guard track_album FK constraint in enrichment loader` | FK guard — track_album | `src/db/load.rs` — add `AND e.parent_album_qid IN (SELECT id FROM album)` to `track_album_sql` | — |
-| 3 | `test(db): add FK guard tests for enrichment loading` | Unit tests | `src/db/load.rs` — `write_test_enrichment_parquet` helper, `test_load_enrichment_album_genre_fk_guard`, `test_load_enrichment_track_album_fk_guard` | Unit |
-| 4 | `chore: verify fix with full test suite and linters` | Verification | — | All existing tests, clippy, fmt |
+| 1 | `fix(db): add album and track FK guards to enrichment load` | FK guards + unit tests | `src/db/load.rs` — two SQL WHERE clauses, two new unit tests | Unit |
 
 ## Step details
 
-### Step 1 — `fix(db): guard album_genre FK constraint in enrichment loader`
+### Step 1 — `fix(db): add album and track FK guards to enrichment load`
 
-**Rationale:** The `album_genre` insert in `load_enrichment()` does not filter against the `genre` table. Genre Q-IDs from album P136 claims may reference genres not present in the `genre` table (measured: 6 out of 56,074 links, 0.01%). DuckDB's `INSERT OR IGNORE` does not suppress FK violations — a hard `Constraint Error` is raised.
-
-**Deliverables:**
-
-- `src/db/load.rs`, `load_enrichment()` function, around line 193:
-  - Add `AND e.genre_qid IN (SELECT id FROM genre)` to the `album_genre_sql` SQL string
-
-**Test strategy:** No tests for this step alone — tests for both guards are added in Step 3.
-
----
-
-### Step 2 — `fix(db): guard track_album FK constraint in enrichment loader`
-
-**Rationale:** The `track_album` insert in `load_enrichment()` does not filter against the `album` table. Track P361 (parent album) claims reference albums that are not linked to any artist in the database (measured: 7,087 out of 7,091 links, 99.9%).
+**Rationale:** Both missing FK guards (`album_genre.album_id → album(id)` and
+`track_album.track_id → track(id)`) must be added to `load_enrichment()`, with tests
+that verify violators are silently dropped and valid rows are inserted.
 
 **Deliverables:**
 
-- `src/db/load.rs`, `load_enrichment()` function, around line 207:
-  - Add `AND e.parent_album_qid IN (SELECT id FROM album)` to the `track_album_sql` SQL string
+- `src/db/load.rs`, `load_enrichment()` function:
+  - `album_genre_sql`: add `AND e.entity_qid IN (SELECT id FROM album)` after the existing `AND e.genre_qid IN (SELECT id FROM genre)`
+  - `track_album_sql`: add `AND e.entity_qid IN (SELECT id FROM track)` after the existing `AND e.parent_album_qid IN (SELECT id FROM album)`
 
-**Test strategy:** No tests for this step alone — tests for both guards are added in Step 3.
+- `src/db/load.rs`, `#[cfg(test)] mod tests` — add two new tests using the existing `write_test_enrichment_parquet` helper:
+  1. **`test_load_enrichment_album_genre_album_id_fk_guard`** — enrichment Parquet with two album rows (entity_qid exists vs. doesn't exist in album table). Pre-populate album and genre. Verify album_genre has exactly 1 row.
+  2. **`test_load_enrichment_track_album_track_id_fk_guard`** — enrichment Parquet with two track rows (entity_qid exists vs. doesn't exist in track table). Pre-populate track and album. Verify track_album has exactly 1 row.
 
----
+**Test strategy:** Unit tests — each test verifies the guard silently drops the violator and inserts the valid row. Both tests reuse the existing `write_test_enrichment_parquet` helper.
 
-### Step 3 — `test(db): add FK guard tests for enrichment loading`
-
-**Rationale:** Add unit tests that verify both FK guards work correctly, following the established pattern in the existing test module.
-
-**Deliverables:**
-
-- `src/db/load.rs`, `#[cfg(test)] mod tests`:
-  1. Add a `write_test_enrichment_parquet(dir: &Path)` helper that writes `enrichment.parquet` with the exact production schema (7 columns: `entity_qid`, `entity_type`, `release_date`, `record_label_qid`, `duration_seconds`, `genre_qid`, `parent_album_qid`), mirroring the existing `write_test_genres_parquet` / `write_test_albums_tracks_parquet` helpers using `StringBuilder` / `ArrowWriter`.
-  2. Add `test_load_enrichment_album_genre_fk_guard` — writes two album rows (`entity_type='album'`): one with `genre_qid` that exists in the `genre` table, one with `genre_qid` that does not. Pre-populates the `genre` table (with the valid genre) and the `album` table (with the valid row's `entity_qid`). Asserts `album_genre` contains exactly the valid row (count = 1, correct `genre_id`).
-  3. Add `test_load_enrichment_track_album_fk_guard` — writes two track rows (`entity_type='track'`): one with `parent_album_qid` that exists in the `album` table, one that does not. Pre-populates the `album` table (with the valid `parent_album_qid`) and the `track` table (with the valid row's `entity_qid`). Asserts `track_album` contains exactly the valid row (count = 1, correct `album_id`).
-
-**Test strategy:** Unit tests — each test verifies both directions of one guard (valid row inserted, invalid row silently dropped).
-
----
-
-### Step 4 — `chore: verify fix with full test suite and linters`
+### Step 2 — Verify with full test suite
 
 **Rationale:** Run the full test suite, linters, and formatter to confirm the fix introduces no regressions. No code changes.
 
-**Deliverables:**
-
-- `cargo test` — all tests pass
-- `cargo clippy -- -D warnings` — no warnings
-- `cargo fmt --check` — formatting is clean
-
-**Commit:** None — verification step only.
+```bash
+cargo test
+cargo clippy -- -D warnings
+cargo fmt --check
+```
