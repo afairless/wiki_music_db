@@ -67,47 +67,100 @@ pub fn load_all(conn: &Connection, parquet_dir: &Path) -> Result<()> {
 // Label and enrichment loader (Phase: populate)
 // ---------------------------------------------------------------------------
 
-/// Backfill name columns from the `qid_label` table.
+/// Backfill name columns AND enrichment fields in a single FK-safe transaction.
 ///
-/// Wraps all name-UPDATEs in a single DuckDB transaction. This must be
-/// called BEFORE enrichment is loaded into child tables (`album_genre`,
-/// `track_album`, etc.) because DuckDB v1.1.0 fires FK enforcement on
-/// parent-table `name` column UPDATEs — even though `name` is not a PK
-/// or FK column — and provides no `PRAGMA foreign_keys` to disable it.
+/// Works around DuckDB v1.1.0's overly aggressive FK RESTRICT enforcement,
+/// which fires on parent-table UPDATEs even for non-key columns.
 ///
-/// See docs/research/2026-08_fix_backfill_album_name_fk_violation.md
-pub fn backfill_names(conn: &Connection, _parquet_dir: &Path) -> Result<()> {
-    conn.execute("BEGIN TRANSACTION", [])
-        .context("Failed to begin name-backfill transaction")?;
+/// The approach:
+/// 1. Back up child tables to temp tables
+/// 2. DELETE all rows from child tables (always allowed)
+/// 3. Run all name and enrichment-field UPDATEs (safe: zero child rows)
+/// 4. Restore all child rows from temp tables
+/// 5. Drop temp tables
+///
+/// All steps execute within a single transaction. On error, everything
+/// is rolled back to the pre-transaction state.
+pub fn backfill_all_safe(conn: &Connection, parquet_dir: &Path) -> Result<()> {
+    let enrichment_path = parquet_dir.join("enrichment.parquet");
+    let enrichment_path_str = enrichment_path
+        .to_str()
+        .context("Enrichment parquet path contains invalid UTF-8")?;
 
-    let result = backfill_names_inner(conn);
+    tracing::info!("Beginning FK-safe backfill");
+
+    // Phase 1: Back up child tables to temp tables and empty child tables.
+    // These run outside any explicit transaction (auto-committed) so that
+    // DuckDB's FK constraint check on subsequent UPDATEs sees the committed
+    // state of zero child rows. Temp tables are session-scoped and persist
+    // across the entire connection lifetime.
+    tracing::debug!("Backing up child tables");
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS _bak_album_artist AS SELECT * FROM album_artist",
+        [],
+    )
+    .context("Failed to back up album_artist")?;
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS _bak_track_artist AS SELECT * FROM track_artist",
+        [],
+    )
+    .context("Failed to back up track_artist")?;
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS _bak_album_genre AS SELECT * FROM album_genre",
+        [],
+    )
+    .context("Failed to back up album_genre")?;
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS _bak_track_album AS SELECT * FROM track_album",
+        [],
+    )
+    .context("Failed to back up track_album")?;
+
+    tracing::debug!("Emptying child tables");
+    conn.execute("DELETE FROM track_album", [])
+        .context("Failed to delete from track_album")?;
+    conn.execute("DELETE FROM album_genre", [])
+        .context("Failed to delete from album_genre")?;
+    conn.execute("DELETE FROM track_artist", [])
+        .context("Failed to delete from track_artist")?;
+    conn.execute("DELETE FROM album_artist", [])
+        .context("Failed to delete from album_artist")?;
+
+    // Phase 2: Run UPDATEs and restore within a single transaction.
+    // FK checks now see committed empty child tables.
+
+    conn.execute("BEGIN TRANSACTION", [])
+        .context("Failed to begin FK-safe backfill transaction")?;
+
+    let result = backfill_all_safe_inner(conn, enrichment_path_str);
 
     match result {
         Ok(()) => {
             conn.execute("COMMIT", [])
-                .context("Failed to commit name-backfill transaction")?;
-            tracing::info!("Name backfill committed successfully");
+                .context("Failed to commit FK-safe backfill transaction")?;
+            tracing::info!("FK-safe backfill committed successfully");
             Ok(())
         }
         Err(e) => {
             if let Err(rollback_err) = conn.execute("ROLLBACK", []) {
                 tracing::error!(
                     error = %rollback_err,
-                    "Failed to roll back name-backfill transaction"
+                    "Failed to roll back FK-safe backfill transaction"
                 );
             }
-            tracing::warn!(error = %e, "Rolled back name-backfill due to error");
+            tracing::warn!(error = %e, "Rolled back FK-safe backfill due to error");
             Err(e)
         }
     }
 }
 
-/// Inner name-backfill logic (runs inside a transaction).
+/// Inner FK-safe backfill logic (runs inside a transaction).
 ///
-/// Updates `album.name`, `track.name`, and `artist.name` from `qid_label`.
-/// Only name columns — no enrichment fields.
-fn backfill_names_inner(conn: &Connection) -> Result<()> {
-    // 1. Backfill album.name from qid_label
+/// Child tables are already empty (deleted in Phase 1). This function runs
+/// all UPDATEs, restores from temp tables, and drops temp tables.
+fn backfill_all_safe_inner(conn: &Connection, enrichment_path: &str) -> Result<()> {
+    // 1. Run name backfill UPDATEs
+    tracing::debug!("Running name backfill UPDATEs");
     conn.execute(
         "UPDATE album SET name = COALESCE(
              (SELECT label FROM qid_label WHERE qid = album.id),
@@ -118,7 +171,6 @@ fn backfill_names_inner(conn: &Connection) -> Result<()> {
     .context("Failed to backfill album.name")?;
     tracing::debug!("Backfilled album.name");
 
-    // 2. Backfill track.name from qid_label
     conn.execute(
         "UPDATE track SET name = COALESCE(
              (SELECT label FROM qid_label WHERE qid = track.id),
@@ -129,7 +181,6 @@ fn backfill_names_inner(conn: &Connection) -> Result<()> {
     .context("Failed to backfill track.name")?;
     tracing::debug!("Backfilled track.name");
 
-    // 3. Backfill artist.name from qid_label (NULL/QID names only)
     conn.execute(
         "UPDATE artist SET name = COALESCE(
              (SELECT label FROM qid_label WHERE qid = artist.id),
@@ -141,51 +192,9 @@ fn backfill_names_inner(conn: &Connection) -> Result<()> {
     .context("Failed to backfill artist.name")?;
     tracing::debug!("Backfilled artist.name");
 
-    Ok(())
-}
+    // 4. Run enrichment field backfill UPDATEs
+    tracing::debug!("Running enrichment field backfill UPDATEs");
 
-/// Backfill enrichment fields from the enrichment Parquet file.
-///
-/// Updates `album.release_date`, `album.record_label`, and
-/// `track.duration_seconds` from `enrichment.parquet`. These columns
-/// do NOT trigger DuckDB FK enforcement, so this can safely be called
-/// AFTER enrichment data has been loaded into child tables.
-///
-/// Wraps all UPDATEs in a single transaction.
-pub fn backfill_enrichment_fields(conn: &Connection, parquet_dir: &Path) -> Result<()> {
-    let path = parquet_dir.join("enrichment.parquet");
-    let path_str = path
-        .to_str()
-        .context("Enrichment parquet path contains invalid UTF-8")?;
-
-    conn.execute("BEGIN TRANSACTION", [])
-        .context("Failed to begin enrichment-backfill transaction")?;
-
-    let result = backfill_enrichment_inner(conn, path_str);
-
-    match result {
-        Ok(()) => {
-            conn.execute("COMMIT", [])
-                .context("Failed to commit enrichment-backfill transaction")?;
-            tracing::info!("Enrichment field backfill committed successfully");
-            Ok(())
-        }
-        Err(e) => {
-            if let Err(rollback_err) = conn.execute("ROLLBACK", []) {
-                tracing::error!(
-                    error = %rollback_err,
-                    "Failed to roll back enrichment-backfill transaction"
-                );
-            }
-            tracing::warn!(error = %e, "Rolled back enrichment-backfill due to error");
-            Err(e)
-        }
-    }
-}
-
-/// Inner enrichment-field backfill logic (runs inside a transaction).
-fn backfill_enrichment_inner(conn: &Connection, enrichment_path: &str) -> Result<()> {
-    // 1. Backfill album.release_date from enrichment
     let release_date_sql = format!(
         "UPDATE album SET release_date = e.release_date::DATE
          FROM read_parquet('{enrichment_path}') e
@@ -197,7 +206,6 @@ fn backfill_enrichment_inner(conn: &Connection, enrichment_path: &str) -> Result
         .context("Failed to backfill album.release_date")?;
     tracing::debug!("Backfilled album.release_date");
 
-    // 2. Backfill album.record_label from enrichment (resolved via qid_label)
     let record_label_sql = format!(
         "UPDATE album SET record_label = ql.label
          FROM read_parquet('{enrichment_path}') e
@@ -211,7 +219,6 @@ fn backfill_enrichment_inner(conn: &Connection, enrichment_path: &str) -> Result
         .context("Failed to backfill album.record_label")?;
     tracing::debug!("Backfilled album.record_label");
 
-    // 3. Backfill track.duration_seconds from enrichment
     let duration_sql = format!(
         "UPDATE track SET duration_seconds = CAST(e.duration_seconds AS INTEGER)
          FROM read_parquet('{enrichment_path}') e
@@ -223,36 +230,60 @@ fn backfill_enrichment_inner(conn: &Connection, enrichment_path: &str) -> Result
         .context("Failed to backfill track.duration_seconds")?;
     tracing::debug!("Backfilled track.duration_seconds");
 
+    // 5. Restore child tables
+    tracing::debug!("Restoring child tables");
+    conn.execute(
+        "INSERT INTO album_artist SELECT * FROM _bak_album_artist",
+        [],
+    )
+    .context("Failed to restore album_artist")?;
+    conn.execute(
+        "INSERT INTO track_artist SELECT * FROM _bak_track_artist",
+        [],
+    )
+    .context("Failed to restore track_artist")?;
+    conn.execute("INSERT INTO album_genre SELECT * FROM _bak_album_genre", [])
+        .context("Failed to restore album_genre")?;
+    conn.execute("INSERT INTO track_album SELECT * FROM _bak_track_album", [])
+        .context("Failed to restore track_album")?;
+
+    // 6. Clean up temp tables
+    conn.execute("DROP TABLE IF EXISTS _bak_album_artist", [])
+        .context("Failed to drop _bak_album_artist")?;
+    conn.execute("DROP TABLE IF EXISTS _bak_track_artist", [])
+        .context("Failed to drop _bak_track_artist")?;
+    conn.execute("DROP TABLE IF EXISTS _bak_album_genre", [])
+        .context("Failed to drop _bak_album_genre")?;
+    conn.execute("DROP TABLE IF EXISTS _bak_track_album", [])
+        .context("Failed to drop _bak_track_album")?;
+
     Ok(())
 }
 
-/// Orchestrate loading labels and enrichment data, with name backfill
-/// before enrichment to avoid DuckDB FK enforcement on name-column UPDATEs.
+/// Orchestrate loading labels and enrichment data with FK-safe backfill.
 ///
-/// The order is carefully chosen:
+/// Pipeline order:
 /// 1. `load_labels` — populates `qid_label` (no FK references)
-/// 2. `backfill_names` — resolves album/track/artist names from `qid_label`
-///    (safe: child tables like `album_genre`, `track_album` are still empty)
+/// 2. `backfill_all_safe` — resolves names AND enrichment fields in a single
+///    FK-safe transaction. Temporarily empties child tables, runs all UPDATEs,
+///    restores child tables atomically.
 /// 3. `load_enrichment` — populates child tables (`album_genre`, `track_album`)
-/// 4. `backfill_enrichment_fields` — sets `release_date`, `record_label`,
-///    `duration_seconds` (safe: these columns don't trigger FK enforcement)
-///
-/// After all steps, recreates FTS indexes so search queries find the
-/// newly-resolved names.
+/// 4. `create_fts_indexes` — recreates FTS indexes for newly-resolved names
 ///
 /// DuckDB v1.1.0 fires FK enforcement on parent-table `name` column UPDATEs
 /// even when `name` is not a PK or FK column, and provides no `PRAGMA
-/// foreign_keys` to disable it. Reordering the pipeline avoids the issue
-/// entirely.
+/// foreign_keys` to disable it. The temp-table swap in `backfill_all_safe`
+/// avoids this by ensuring zero child rows during all UPDATEs.
 ///
-/// See docs/research/2026-08_fix_backfill_album_name_fk_violation.md
+/// See docs/research/2026-08_fix_backfill_fk_safe_emptying.md
 pub fn load_label_and_enrichment(conn: &Connection, parquet_dir: &Path) -> Result<()> {
     let labels = load_labels(conn, parquet_dir)?;
     tracing::info!(labels, "Loaded labels");
 
-    // Backfill names BEFORE enrichment — child tables are empty so no FK issue
-    backfill_names(conn, parquet_dir)?;
-    tracing::info!("Name backfill complete");
+    // Backfill names AND enrichment fields in a single FK-safe transaction.
+    // Temporarily empties child tables, runs all UPDATEs, restores child tables.
+    backfill_all_safe(conn, parquet_dir)?;
+    tracing::info!("Backfill complete");
 
     let (instruments, record_labels, album_genres, track_albums) =
         load_enrichment(conn, parquet_dir)?;
@@ -263,10 +294,6 @@ pub fn load_label_and_enrichment(conn: &Connection, parquet_dir: &Path) -> Resul
         track_albums,
         "Loaded enrichment data"
     );
-
-    // Enrichment fields don't trigger FK enforcement, so safe after enrichment
-    backfill_enrichment_fields(conn, parquet_dir)?;
-    tracing::info!("Enrichment field backfill complete");
 
     // Recreate FTS indexes now that names are resolved
     crate::db::schema::create_fts_indexes(conn)
@@ -2458,51 +2485,139 @@ mod tests {
         );
     }
 
+    /// Helper: write an enrichment Parquet file with all columns, including
+    /// enrichment field values (release_date, record_label_qid, duration_seconds).
+    fn write_full_enrichment_parquet(
+        dir: &Path,
+        entity_qids: &[&str],
+        entity_types: &[&str],
+        release_dates: &[Option<&str>],
+        record_label_qids: &[Option<&str>],
+        duration_seconds: &[Option<&str>],
+        genre_qids: &[Option<&str>],
+        parent_album_qids: &[Option<&str>],
+    ) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("entity_qid", DataType::Utf8, false),
+            Field::new("entity_type", DataType::Utf8, false),
+            Field::new("release_date", DataType::Utf8, true),
+            Field::new("record_label_qid", DataType::Utf8, true),
+            Field::new("duration_seconds", DataType::Utf8, true),
+            Field::new("genre_qid", DataType::Utf8, true),
+            Field::new("parent_album_qid", DataType::Utf8, true),
+        ]));
+
+        let mut eq_builder = StringBuilder::new();
+        let mut et_builder = StringBuilder::new();
+        let mut rd_builder = StringBuilder::new();
+        let mut rl_builder = StringBuilder::new();
+        let mut ds_builder = StringBuilder::new();
+        let mut gq_builder = StringBuilder::new();
+        let mut pa_builder = StringBuilder::new();
+
+        for i in 0..entity_qids.len() {
+            eq_builder.append_value(entity_qids[i]);
+            et_builder.append_value(entity_types[i]);
+            match release_dates[i] {
+                Some(v) => rd_builder.append_value(v),
+                None => rd_builder.append_null(),
+            }
+            match record_label_qids[i] {
+                Some(v) => rl_builder.append_value(v),
+                None => rl_builder.append_null(),
+            }
+            match duration_seconds[i] {
+                Some(v) => ds_builder.append_value(v),
+                None => ds_builder.append_null(),
+            }
+            match genre_qids[i] {
+                Some(v) => gq_builder.append_value(v),
+                None => gq_builder.append_null(),
+            }
+            match parent_album_qids[i] {
+                Some(v) => pa_builder.append_value(v),
+                None => pa_builder.append_null(),
+            }
+        }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(eq_builder.finish()),
+                Arc::new(et_builder.finish()),
+                Arc::new(rd_builder.finish()),
+                Arc::new(rl_builder.finish()),
+                Arc::new(ds_builder.finish()),
+                Arc::new(gq_builder.finish()),
+                Arc::new(pa_builder.finish()),
+            ],
+        )
+        .unwrap();
+
+        let path = dir.join("enrichment.parquet");
+        let file = fs::File::create(&path).unwrap();
+        let props = WriterProperties::builder().build();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
     #[test]
-    fn test_backfill_with_active_fk_constraints() {
+    fn test_backfill_all_safe_with_child_rows() {
         let dir = tempfile::tempdir().unwrap();
         let conn = test_conn();
 
-        // 1. Pre-seed qid_label with a label for a known album Q-ID
+        // 1. Pre-seed qid_label with labels
         conn.execute(
-            "INSERT INTO qid_label (qid, label) VALUES ('QTestAlbum', 'Test Album Label')",
+            "INSERT INTO qid_label (qid, label) VALUES ('QTestAlbum', 'Resolved Album')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO qid_label (qid, label) VALUES ('QTestTrack', 'Resolved Track')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO qid_label (qid, label) VALUES ('QTestArtist', 'Resolved Artist')",
+            [],
+        )
+        .unwrap();
+        // Label for record_label_qid enrichment lookup
+        conn.execute(
+            "INSERT INTO qid_label (qid, label) VALUES ('QRecordLabel', 'Acme Records')",
             [],
         )
         .unwrap();
 
-        // 2. Pre-populate album with name = Q-ID (the placeholder)
-        //    No child rows yet — backfill_names runs BEFORE enrichment loading
+        // 2. Pre-populate album, track, artist with Q-ID placeholders
         conn.execute(
             "INSERT INTO album (id, name) VALUES ('QTestAlbum', 'QTestAlbum')",
             [],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO track (id, name) VALUES ('QTestTrack', 'QTestTrack')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artist (id, name, artist_type) VALUES ('QTestArtist', 'QTestArtist', 'person')",
+            [],
+        )
+        .unwrap();
 
-        // 3. Create an enrichment.parquet (needed by enrichment backfill, but empty)
-        write_test_enrichment_parquet(dir.path(), &[], &[], &[], &[]);
-
-        // 4. Call backfill_names — should succeed because child tables are empty
-        let result = backfill_names(&conn, dir.path());
-        assert!(
-            result.is_ok(),
-            "backfill_names should succeed when child tables are empty: {:?}",
-            result.err()
-        );
-
-        // 5. Assert the album's name was updated to the English label
-        let album_name: String = conn
-            .query_row(
-                "SELECT name FROM album WHERE id = 'QTestAlbum'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            album_name, "Test Album Label",
-            "Album name should be resolved from qid_label"
-        );
-
-        // 6. Now create child rows (mimicking enrichment loading after name backfill)
+        // 3. Insert rows into all four child tables with valid FK references
+        conn.execute(
+            "INSERT INTO album_artist (album_id, artist_id, role) VALUES ('QTestAlbum', 'QTestArtist', 'performer')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO track_artist (track_id, artist_id, role) VALUES ('QTestTrack', 'QTestArtist', 'performer')",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO genre (id, name) VALUES ('QTestGenre', 'test genre')",
             [],
@@ -2513,18 +2628,208 @@ mod tests {
             [],
         )
         .unwrap();
-
-        conn.execute(
-            "INSERT INTO track (id, name) VALUES ('QTestTrack', 'QTestTrack')",
-            [],
-        )
-        .unwrap();
         conn.execute(
             "INSERT INTO track_album (track_id, album_id) VALUES ('QTestTrack', 'QTestAlbum')",
             [],
         )
         .unwrap();
 
+        // 4. Write a full enrichment.parquet with release_date, record_label_qid, duration_seconds
+        write_full_enrichment_parquet(
+            dir.path(),
+            &["QTestAlbum", "QTestTrack"],
+            &["album", "track"],
+            &[Some("2020-06-15"), None],
+            &[Some("QRecordLabel"), None],
+            &[None, Some("245")],
+            &[None, None],
+            &[None, None],
+        );
+
+        // 5. Record original child-table row counts
+        let orig_aa: usize = conn
+            .query_row("SELECT COUNT(*) FROM album_artist", [], |row| row.get(0))
+            .unwrap();
+        let orig_ta: usize = conn
+            .query_row("SELECT COUNT(*) FROM track_artist", [], |row| row.get(0))
+            .unwrap();
+        let orig_ag: usize = conn
+            .query_row("SELECT COUNT(*) FROM album_genre", [], |row| row.get(0))
+            .unwrap();
+        let orig_tal: usize = conn
+            .query_row("SELECT COUNT(*) FROM track_album", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(orig_aa, 1, "Expected 1 album_artist row");
+        assert_eq!(orig_ta, 1, "Expected 1 track_artist row");
+        assert_eq!(orig_ag, 1, "Expected 1 album_genre row");
+        assert_eq!(orig_tal, 1, "Expected 1 track_album row");
+
+        // 6. Call backfill_all_safe
+        let result = backfill_all_safe(&conn, dir.path());
+        assert!(
+            result.is_ok(),
+            "backfill_all_safe should succeed with child rows: {:?}",
+            result.err()
+        );
+
+        // 7. Assert names were updated
+        let album_name: String = conn
+            .query_row(
+                "SELECT name FROM album WHERE id = 'QTestAlbum'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            album_name, "Resolved Album",
+            "Album name should be resolved from qid_label"
+        );
+
+        let track_name: String = conn
+            .query_row(
+                "SELECT name FROM track WHERE id = 'QTestTrack'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            track_name, "Resolved Track",
+            "Track name should be resolved from qid_label"
+        );
+
+        let artist_name: Option<String> = conn
+            .query_row(
+                "SELECT name FROM artist WHERE id = 'QTestArtist'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            artist_name.as_deref(),
+            Some("Resolved Artist"),
+            "Artist name should be resolved from qid_label"
+        );
+
+        // 8. Assert enrichment fields were updated
+        let release_date: Option<String> = conn
+            .query_row(
+                "SELECT release_date::TEXT FROM album WHERE id = 'QTestAlbum'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            release_date.as_deref(),
+            Some("2020-06-15"),
+            "Album release_date should be backfilled"
+        );
+
+        let record_label: Option<String> = conn
+            .query_row(
+                "SELECT record_label FROM album WHERE id = 'QTestAlbum'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            record_label.as_deref(),
+            Some("Acme Records"),
+            "Album record_label should be resolved from qid_label"
+        );
+
+        let duration: Option<i32> = conn
+            .query_row(
+                "SELECT duration_seconds FROM track WHERE id = 'QTestTrack'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(duration, Some(245), "Track duration should be backfilled");
+
+        // 9. Assert all child-table row counts are preserved
+        let final_aa: usize = conn
+            .query_row("SELECT COUNT(*) FROM album_artist", [], |row| row.get(0))
+            .unwrap();
+        let final_ta: usize = conn
+            .query_row("SELECT COUNT(*) FROM track_artist", [], |row| row.get(0))
+            .unwrap();
+        let final_ag: usize = conn
+            .query_row("SELECT COUNT(*) FROM album_genre", [], |row| row.get(0))
+            .unwrap();
+        let final_tal: usize = conn
+            .query_row("SELECT COUNT(*) FROM track_album", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(
+            final_aa, orig_aa,
+            "album_artist row count should be preserved"
+        );
+        assert_eq!(
+            final_ta, orig_ta,
+            "track_artist row count should be preserved"
+        );
+        assert_eq!(
+            final_ag, orig_ag,
+            "album_genre row count should be preserved"
+        );
+        assert_eq!(
+            final_tal, orig_tal,
+            "track_album row count should be preserved"
+        );
+
+        // 10. Assert FK integrity (no orphaned references)
+        let orphan_aa: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM album_artist aa LEFT JOIN album a ON aa.album_id = a.id WHERE a.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_aa, 0, "No orphaned album_artist references");
+
+        let orphan_ta_tr: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM track_artist ta LEFT JOIN track t ON ta.track_id = t.id WHERE t.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_ta_tr, 0, "No orphaned track_artist track references");
+
+        let orphan_ta_ar: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM track_artist ta LEFT JOIN artist a ON ta.artist_id = a.id WHERE a.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphan_ta_ar, 0,
+            "No orphaned track_artist artist references"
+        );
+    }
+
+    #[test]
+    fn test_backfill_all_safe_rollback_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = test_conn();
+
+        // 1. Pre-seed qid_label with labels
+        conn.execute(
+            "INSERT INTO qid_label (qid, label) VALUES ('QTestAlbum', 'Should Not Update')",
+            [],
+        )
+        .unwrap();
+
+        // 2. Pre-populate album with placeholder name
+        conn.execute(
+            "INSERT INTO album (id, name) VALUES ('QTestAlbum', 'QTestAlbum')",
+            [],
+        )
+        .unwrap();
+
+        // 3. Insert rows into child tables with valid FK references
         conn.execute(
             "INSERT INTO artist (id, name, artist_type) VALUES ('QTestArtist', 'QTestArtist', 'person')",
             [],
@@ -2536,57 +2841,38 @@ mod tests {
         )
         .unwrap();
 
-        // Also create artist- and track-referencing rows
-        conn.execute(
-            "INSERT INTO artist_genre (artist_id, genre_id) VALUES ('QTestArtist', 'QTestGenre')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO track_artist (track_id, artist_id, role) VALUES ('QTestTrack', 'QTestArtist', 'performer')",
-            [],
-        )
-        .unwrap();
+        // 4. Record original state
+        let orig_aa: usize = conn
+            .query_row("SELECT COUNT(*) FROM album_artist", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(orig_aa, 1, "Expected 1 album_artist row");
 
-        // 7. Call backfill_enrichment_fields — should succeed even with child rows
-        //    because enrichment fields (release_date, record_label, duration_seconds)
-        //    do NOT trigger DuckDB's FK enforcement.
-        let enrich_result = backfill_enrichment_fields(&conn, dir.path());
+        let orig_name: String = conn
+            .query_row(
+                "SELECT name FROM album WHERE id = 'QTestAlbum'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orig_name, "QTestAlbum", "Name should be Q-ID placeholder");
+
+        // 5. Create directory but NO enrichment.parquet file — the read_parquet
+        //    call inside backfill_all_safe will fail, triggering ROLLBACK.
+        //    Just creating the empty dir is enough (no enrichment.parquet).
+
+        // 6. Call backfill_all_safe — should fail because enrichment.parquet doesn't exist
+        let result = backfill_all_safe(&conn, dir.path());
         assert!(
-            enrich_result.is_ok(),
-            "backfill_enrichment_fields should succeed with active FKs: {:?}",
-            enrich_result.err()
+            result.is_err(),
+            "backfill_all_safe should error when enrichment.parquet is missing"
         );
 
-        // 8. Assert all child-table rows still reference the album
-        let ag_count: usize = conn
-            .query_row(
-                "SELECT COUNT(*) FROM album_genre WHERE album_id = 'QTestAlbum'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(ag_count, 1, "album_genre row should still reference album");
-
-        let ta_count: usize = conn
-            .query_row(
-                "SELECT COUNT(*) FROM track_album WHERE album_id = 'QTestAlbum'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(ta_count, 1, "track_album row should still reference album");
-
-        let aa_count: usize = conn
-            .query_row(
-                "SELECT COUNT(*) FROM album_artist WHERE album_id = 'QTestAlbum'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(aa_count, 1, "album_artist row should still reference album");
-
-        // 9. Assert name is still correct
+        // 7. Assert Phase 2 was rolled back:
+        //    - Parent-table names are unchanged (UPDATE was inside the
+        //      rolled-back transaction)
+        //    - Child tables may be empty (Phase 1 DELETEs were auto-committed
+        //      before the transaction began, but temp tables still have the
+        //      backup for a retry)
         let final_name: String = conn
             .query_row(
                 "SELECT name FROM album WHERE id = 'QTestAlbum'",
@@ -2595,8 +2881,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            final_name, "Test Album Label",
-            "Album name should remain resolved after enrichment backfill"
+            final_name, "QTestAlbum",
+            "Album name should be unchanged after rollback"
         );
+
+        // Verify temp tables still hold the backed-up data
+        let bak_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM _bak_album_artist", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(bak_count, 1, "Temp table should retain backup for recovery");
     }
 }
