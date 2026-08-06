@@ -2104,4 +2104,195 @@ mod tests {
             .unwrap();
         assert_eq!(ta_count, 1, "Expected 1 track_artist row");
     }
+
+    // -----------------------------------------------------------------------
+    // load_enrichment FK guard tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: write an enrichment Parquet file with the production schema.
+    ///
+    /// Columns: entity_qid, entity_type, release_date, record_label_qid,
+    /// duration_seconds, genre_qid, parent_album_qid.
+    ///
+    /// Only the last four columns are nullable. The first two are always
+    /// required. Callers provide parallel arrays for the four key columns;
+    /// the remaining three nullable columns (release_date, record_label_qid,
+    /// duration_seconds) are set to NULL.
+    fn write_test_enrichment_parquet(
+        dir: &Path,
+        entity_qids: &[&str],
+        entity_types: &[&str],
+        genre_qids: &[Option<&str>],
+        parent_album_qids: &[Option<&str>],
+    ) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("entity_qid", DataType::Utf8, false),
+            Field::new("entity_type", DataType::Utf8, false),
+            Field::new("release_date", DataType::Utf8, true),
+            Field::new("record_label_qid", DataType::Utf8, true),
+            Field::new("duration_seconds", DataType::Utf8, true),
+            Field::new("genre_qid", DataType::Utf8, true),
+            Field::new("parent_album_qid", DataType::Utf8, true),
+        ]));
+
+        let mut eq_builder = StringBuilder::new();
+        let mut et_builder = StringBuilder::new();
+        let mut rd_builder = StringBuilder::new();
+        let mut rl_builder = StringBuilder::new();
+        let mut ds_builder = StringBuilder::new();
+        let mut gq_builder = StringBuilder::new();
+        let mut pa_builder = StringBuilder::new();
+
+        for i in 0..entity_qids.len() {
+            eq_builder.append_value(entity_qids[i]);
+            et_builder.append_value(entity_types[i]);
+            rd_builder.append_null();
+            rl_builder.append_null();
+            ds_builder.append_null();
+            match genre_qids[i] {
+                Some(v) => gq_builder.append_value(v),
+                None => gq_builder.append_null(),
+            }
+            match parent_album_qids[i] {
+                Some(v) => pa_builder.append_value(v),
+                None => pa_builder.append_null(),
+            }
+        }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(eq_builder.finish()),
+                Arc::new(et_builder.finish()),
+                Arc::new(rd_builder.finish()),
+                Arc::new(rl_builder.finish()),
+                Arc::new(ds_builder.finish()),
+                Arc::new(gq_builder.finish()),
+                Arc::new(pa_builder.finish()),
+            ],
+        )
+        .unwrap();
+
+        let path = dir.join("enrichment.parquet");
+        let file = fs::File::create(&path).unwrap();
+        let props = WriterProperties::builder().build();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    #[test]
+    fn test_load_enrichment_album_genre_fk_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = test_conn();
+
+        // Pre-populate the genre table with one valid genre
+        conn.execute("INSERT INTO genre (id, name) VALUES ('Q35718', 'jazz')", [])
+            .unwrap();
+
+        // Write enrichment Parquet with two album rows:
+        // - Row 1: genre_qid = 'Q35718' (exists in genre table)
+        // - Row 2: genre_qid = 'Q99999' (does not exist in genre table)
+        write_test_enrichment_parquet(
+            dir.path(),
+            &["QAlbum1", "QAlbum2"],
+            &["album", "album"],
+            &[Some("Q35718"), Some("Q99999")],
+            &[None, None],
+        );
+
+        // Pre-populate album table with both QAlbum1 and QAlbum2
+        // (album_genre.album_id → album(id) FK must be satisfied)
+        conn.execute(
+            "INSERT INTO album (id, name) VALUES ('QAlbum1', 'Test Album 1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO album (id, name) VALUES ('QAlbum2', 'Test Album 2')",
+            [],
+        )
+        .unwrap();
+
+        // Load enrichment — should not error despite the invalid genre_qid
+        let result = load_enrichment(&conn, dir.path());
+        assert!(
+            result.is_ok(),
+            "load_enrichment should succeed with FK guard"
+        );
+
+        // Verify album_genre contains exactly the valid row
+        let count: usize = conn
+            .query_row("SELECT COUNT(*) FROM album_genre", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "Expected 1 album_genre row (valid genre only)");
+
+        let genre_id: String = conn
+            .query_row(
+                "SELECT genre_id FROM album_genre WHERE album_id = 'QAlbum1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(genre_id, "Q35718", "Genre should match the valid genre");
+    }
+
+    #[test]
+    fn test_load_enrichment_track_album_fk_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = test_conn();
+
+        // Pre-populate the album table with one valid album
+        conn.execute(
+            "INSERT INTO album (id, name) VALUES ('QAlbum1', 'Test Album 1')",
+            [],
+        )
+        .unwrap();
+
+        // Write enrichment Parquet with two track rows:
+        // - Row 1: parent_album_qid = 'QAlbum1' (exists in album table)
+        // - Row 2: parent_album_qid = 'Q99999' (does not exist in album table)
+        write_test_enrichment_parquet(
+            dir.path(),
+            &["QTrack1", "QTrack2"],
+            &["track", "track"],
+            &[None, None],
+            &[Some("QAlbum1"), Some("Q99999")],
+        );
+
+        // Pre-populate track table with both QTrack1 and QTrack2
+        // (track_album.track_id → track(id) FK must be satisfied)
+        conn.execute(
+            "INSERT INTO track (id, name) VALUES ('QTrack1', 'Test Track 1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO track (id, name) VALUES ('QTrack2', 'Test Track 2')",
+            [],
+        )
+        .unwrap();
+
+        // Load enrichment — should not error despite the invalid parent_album_qid
+        let result = load_enrichment(&conn, dir.path());
+        assert!(
+            result.is_ok(),
+            "load_enrichment should succeed with FK guard"
+        );
+
+        // Verify track_album contains exactly the valid row
+        let count: usize = conn
+            .query_row("SELECT COUNT(*) FROM track_album", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "Expected 1 track_album row (valid album only)");
+
+        let album_id: String = conn
+            .query_row(
+                "SELECT album_id FROM track_album WHERE track_id = 'QTrack1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(album_id, "QAlbum1", "Album should match the valid album");
+    }
 }
