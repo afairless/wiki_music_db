@@ -187,7 +187,8 @@ pub fn load_enrichment(
          FROM read_parquet('{path_str}') e
          WHERE e.entity_type = 'album'
            AND e.genre_qid IS NOT NULL
-           AND e.genre_qid IN (SELECT id FROM genre)"
+           AND e.genre_qid IN (SELECT id FROM genre)
+           AND e.entity_qid IN (SELECT id FROM album)"
     );
     conn.execute(&album_genre_sql, [])
         .context("Failed to load album_genre from enrichment")?;
@@ -203,7 +204,8 @@ pub fn load_enrichment(
          FROM read_parquet('{path_str}') e
          WHERE e.entity_type = 'track'
            AND e.parent_album_qid IS NOT NULL
-           AND e.parent_album_qid IN (SELECT id FROM album)"
+           AND e.parent_album_qid IN (SELECT id FROM album)
+           AND e.entity_qid IN (SELECT id FROM track)"
     );
     conn.execute(&track_album_sql, [])
         .context("Failed to load track_album from enrichment")?;
@@ -2294,5 +2296,112 @@ mod tests {
             )
             .unwrap();
         assert_eq!(album_id, "QAlbum1", "Album should match the valid album");
+    }
+
+    #[test]
+    fn test_load_enrichment_album_genre_album_id_fk_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = test_conn();
+
+        // Pre-populate the genre table with one valid genre
+        conn.execute("INSERT INTO genre (id, name) VALUES ('Q35718', 'jazz')", [])
+            .unwrap();
+
+        // Pre-populate album table with one valid album
+        conn.execute(
+            "INSERT INTO album (id, name) VALUES ('QValidAlbum', 'Valid Album')",
+            [],
+        )
+        .unwrap();
+
+        // Write enrichment Parquet with two album rows:
+        // - Row 1: entity_qid = 'QValidAlbum' (exists in album table), valid genre
+        // - Row 2: entity_qid = 'QMissingAlbum' (does NOT exist in album table), valid genre
+        write_test_enrichment_parquet(
+            dir.path(),
+            &["QValidAlbum", "QMissingAlbum"],
+            &["album", "album"],
+            &[Some("Q35718"), Some("Q35718")],
+            &[None, None],
+        );
+
+        // Load enrichment — should not error despite the missing album entity_qid
+        let result = load_enrichment(&conn, dir.path());
+        assert!(
+            result.is_ok(),
+            "load_enrichment should succeed with album FK guard"
+        );
+
+        // Verify album_genre contains exactly the valid row
+        let count: usize = conn
+            .query_row("SELECT COUNT(*) FROM album_genre", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "Expected 1 album_genre row (valid album entity_qid only)"
+        );
+
+        let album_id: String = conn
+            .query_row("SELECT album_id FROM album_genre", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            album_id, "QValidAlbum",
+            "Album should match the existing album"
+        );
+    }
+
+    #[test]
+    fn test_load_enrichment_track_album_track_id_fk_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = test_conn();
+
+        // Pre-populate the album table with one valid album
+        conn.execute(
+            "INSERT INTO album (id, name) VALUES ('QValidAlbum', 'Valid Album')",
+            [],
+        )
+        .unwrap();
+
+        // Pre-populate track table with one valid track
+        conn.execute(
+            "INSERT INTO track (id, name) VALUES ('QValidTrack', 'Valid Track')",
+            [],
+        )
+        .unwrap();
+
+        // Write enrichment Parquet with two track rows:
+        // - Row 1: entity_qid = 'QValidTrack' (exists in track table), valid parent album
+        // - Row 2: entity_qid = 'QMissingTrack' (does NOT exist in track table), valid parent album
+        write_test_enrichment_parquet(
+            dir.path(),
+            &["QValidTrack", "QMissingTrack"],
+            &["track", "track"],
+            &[None, None],
+            &[Some("QValidAlbum"), Some("QValidAlbum")],
+        );
+
+        // Load enrichment — should not error despite the missing track entity_qid
+        let result = load_enrichment(&conn, dir.path());
+        assert!(
+            result.is_ok(),
+            "load_enrichment should succeed with track FK guard"
+        );
+
+        // Verify track_album contains exactly the valid row
+        let count: usize = conn
+            .query_row("SELECT COUNT(*) FROM track_album", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "Expected 1 track_album row (valid track entity_qid only)"
+        );
+
+        let track_id: String = conn
+            .query_row("SELECT track_id FROM track_album", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            track_id, "QValidTrack",
+            "Track should match the existing track"
+        );
     }
 }
