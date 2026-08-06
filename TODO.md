@@ -1,132 +1,71 @@
-# Implementation Plan: Populate Album, Track, and Other Name Columns
+# Implementation Plan: Fix FK Constraint Violations in Enrichment Loading
 
-Source: `docs/research/2026-08_populate_names_research.md`
-
-## Context
-
-This plan builds on the existing wiki_db pipeline (Phases 1–8 completed). The database currently stores Q-ID placeholders for album/track names, NULL artist names, empty `album_genre` and `track_album` tables, and NULL enrichment columns (release dates, record labels, durations). This plan resolves all of those via a re-scan of the Wikidata dump that extracts labels, claims, and cross-references for all referenced Q-IDs.
-
-| # | Commit message | Logical unit | Key deliverables | Tests |
-|---|---|---|---|---|
-| 1 | `feat(db): add qid_label, instrument, and record_label tables` | Schema migration | `src/db/schema.rs` — add 3 tables, bump SCHEMA_VERSION to 2, add migration path | Unit |
-| 2 | `feat: implement Q-ID label and claims extraction from Wikidata dump` | Label extractor | `src/label_extractor.rs` — Q-ID collection, stream scan, substring pre-check, Parquet writer for `labels.parquet` and `enrichment.parquet` | Unit, property-based |
-| 3 | `feat(db): add label and enrichment Parquet loader with backfill` | DuckDB loader | `src/db/load.rs` — load labels/enrichment, backfill UPDATEs in transaction, recreate FTS, deprecate `extract_genre_labels()` | Integration |
-| 4 | `feat(cli): add populate subcommand for name/date/label backfill` | CLI subcommand | `src/cli/populate.rs` — `populate` subcommand with `--force`, `--resume`; `src/cli/mod.rs` — register; `src/main.rs` — wire | Unit, integration |
-| 5 | `feat(update): fetch labels for new entities during incremental update` | Update pipeline | `src/sparql.rs` — extend `fetch_entity` response; `src/db/load.rs` — upsert labels; `src/cli/update.rs` — wire label resolution | Unit |
-
----
-
-# Populate Substring Pre-Check Performance Optimization
-
-Source: `docs/research/2026-08_populate_performance_optimization.md`
+Source: `docs/research/2026-08_fix_enrichment_fk_constraints.md`
 
 ## Context
 
-The `populate` subcommand's `extract_labels_and_claims()` in `src/label_extractor.rs` has a severe performance bottleneck. The substring pre-check iterates through every Q-ID in a ~2.6M-element HashSet and performs a `String::contains()` scan for each one, achieving only ~13 KB/s throughput — projecting a **~134 day runtime** for the full 155 GB dump.
+The `populate` subcommand's `load_enrichment()` function in `src/db/load.rs` fails with foreign key constraint violations when loading into `album_genre` and `track_album` junction tables. The `album_genre` insert lacks a `WHERE genre_qid IN (SELECT id FROM genre)` FK guard, and `track_album` lacks a `WHERE parent_album_qid IN (SELECT id FROM album)` FK guard. Both are needed because enrichment data references genres/albums that may not exist in the database.
 
-This plan replaces the O(K × L) pre-check with an **Aho-Corasick automaton** that finds all pattern matches in a single pass over the text, regardless of the number of patterns. Expected speedup: **1,500–3,700×** (from 134 days to ~25–35 minutes).
+The fix is purely additive SQL — two `AND ... IN (SELECT ...)` clauses following the established pattern in `load_artist_genre()` and `load_artist_member_of()`.
 
 | # | Commit message | Logical unit | Key deliverables | Tests |
 |---|---|---|---|---|
-| 1 | `build(deps): add aho-corasick for multi-pattern substring matching` | Dependency | `Cargo.toml` — add `aho-corasick = "1"` | — |
-| 2 | `perf(label_extractor): replace O(n) substring scan with Aho-Corasick automaton` | Pre-check optimization | `src/label_extractor.rs` — automaton build, two-tier filter (automaton + discovered_qids fallback), P264 insertion site update | Unit, property-based |
+| 1 | `fix(db): guard album_genre FK constraint in enrichment loader` | FK guard — album_genre | `src/db/load.rs` — add `AND e.genre_qid IN (SELECT id FROM genre)` to `album_genre_sql` | — |
+| 2 | `fix(db): guard track_album FK constraint in enrichment loader` | FK guard — track_album | `src/db/load.rs` — add `AND e.parent_album_qid IN (SELECT id FROM album)` to `track_album_sql` | — |
+| 3 | `test(db): add FK guard tests for enrichment loading` | Unit tests | `src/db/load.rs` — `write_test_enrichment_parquet` helper, `test_load_enrichment_album_genre_fk_guard`, `test_load_enrichment_track_album_fk_guard` | Unit |
+| 4 | `chore: verify fix with full test suite and linters` | Verification | — | All existing tests, clippy, fmt |
 
 ## Step details
 
-### Step 1 — `build(deps): add aho-corasick for multi-pattern substring matching`
+### Step 1 — `fix(db): guard album_genre FK constraint in enrichment loader`
 
-**Rationale:** The `aho-corasick` crate provides the multi-pattern string matching automaton needed to replace the O(K × L) `HashSet::iter().any()` pre-check loop.
+**Rationale:** The `album_genre` insert in `load_enrichment()` does not filter against the `genre` table. Genre Q-IDs from album P136 claims may reference genres not present in the `genre` table (measured: 6 out of 56,074 links, 0.01%). DuckDB's `INSERT OR IGNORE` does not suppress FK violations — a hard `Constraint Error` is raised.
 
 **Deliverables:**
 
-- `Cargo.toml`:
-  - Add `aho-corasick = "1"` to `[dependencies]`
+- `src/db/load.rs`, `load_enrichment()` function, around line 193:
+  - Add `AND e.genre_qid IN (SELECT id FROM genre)` to the `album_genre_sql` SQL string
 
-**Tests:** None — purely a build configuration change.
+**Test strategy:** No tests for this step alone — tests for both guards are added in Step 3.
 
 ---
 
-### Step 2 — `perf(label_extractor): replace O(n) substring scan with Aho-Corasick automaton`
+### Step 2 — `fix(db): guard track_album FK constraint in enrichment loader`
 
-**Rationale:** Replace the per-line `HashSet::iter().any(|qid| line.contains(qid))` loop (O(K × L) where K ≈ 2.6M) with a two-tier filter: an Aho-Corasick automaton for the bulk Q-IDs (O(L) single pass), plus a linear fallback over dynamically discovered Q-IDs (tiny set, typically hundreds).
+**Rationale:** The `track_album` insert in `load_enrichment()` does not filter against the `album` table. Track P361 (parent album) claims reference albums that are not linked to any artist in the database (measured: 7,087 out of 7,091 links, 99.9%).
 
 **Deliverables:**
 
-- `src/label_extractor.rs`:
-  1. Add `use aho_corasick::AhoCorasick;` to the top-level imports.
-  2. Add early return guard at the top of `extract_labels_and_claims()`:
+- `src/db/load.rs`, `load_enrichment()` function, around line 207:
+  - Add `AND e.parent_album_qid IN (SELECT id FROM album)` to the `track_album_sql` SQL string
 
-     ```rust
-     if qid_sets.all.is_empty() {
-         tracing::info!("No Q-IDs to match — skipping label extraction");
-         return Ok(());
-     }
-     ```
-
-  3. Build the automaton once from all Q-IDs:
-
-     ```rust
-     let qid_patterns: Vec<&str> = qid_sets.all.iter().map(|s| s.as_str()).collect();
-     let ac = AhoCorasick::new(&qid_patterns);
-     let mut discovered_qids: HashSet<String> = HashSet::new();
-     ```
-
-  4. Replace the substring pre-check with a two-tier filter:
-
-     ```rust
-     // Before:
-     if !qid_sets.all.iter().any(|qid| line.contains(qid.as_str())) {
-         continue;
-     }
-     // After:
-     if ac.find(&line).is_none()
-         && !discovered_qids.iter().any(|qid| line.contains(qid.as_str()))
-     {
-         continue;
-     }
-     ```
-
-  5. Update the P264 dynamic-insertion site to also insert into `discovered_qids`:
-
-     ```rust
-     // Before:
-     if let Some(ref rl_qid) = record_label_qid
-         && qid_sets.all.insert(rl_qid.clone())
-     {
-         discovered_label_qids.push(rl_qid.clone());
-     }
-     // After:
-     if let Some(ref rl_qid) = record_label_qid
-         && qid_sets.all.insert(rl_qid.clone())
-     {
-         discovered_qids.insert(rl_qid.clone());
-         discovered_label_qids.push(rl_qid.clone());
-     }
-     ```
-
-- **Tests (unit in `src/label_extractor.rs`):**
-  - `test_aho_corasick_precheck_match` — Line containing a Q-ID is matched by the automaton
-  - `test_aho_corasick_precheck_skip` — Line without any Q-ID is correctly skipped
-  - `test_aho_corasick_precheck_false_positive` — Substring false positive (e.g., Q2831 in Q28310) passes pre-check but is correctly filtered by full Q-ID comparison
-  - `test_aho_corasick_many_patterns` — Building from 10K+ Q-IDs works correctly and finds matches
-  - `test_empty_qid_set_returns_early` — Calling with an empty `qid_sets.all` returns `Ok(())` without error
-  - `test_discovered_qids_fallback` — A Q-ID added to `discovered_qids` mid-scan matches a line via the linear fallback
-  - `test_aho_corasick_equivalent_to_hashset_contains` — Property-based test with random Q-ID sets and random lines, verifying automaton matches exactly the same lines as the original `HashSet::iter().any()` approach
-
-- **Test updates:**
-  - Update existing `test_substring_precheck_match`, `test_substring_precheck_skip`, `test_substring_precheck_false_positive` to exercise the Aho-Corasick path via a helper function
+**Test strategy:** No tests for this step alone — tests for both guards are added in Step 3.
 
 ---
 
-### Step 3 — Integration validation
+### Step 3 — `test(db): add FK guard tests for enrichment loading`
 
-**Rationale:** Run the full test suite and linters to confirm the optimization preserves correctness. No code changes.
+**Rationale:** Add unit tests that verify both FK guards work correctly, following the established pattern in the existing test module.
 
 **Deliverables:**
 
-- `cargo test` — all existing tests pass without modification
+- `src/db/load.rs`, `#[cfg(test)] mod tests`:
+  1. Add a `write_test_enrichment_parquet(dir: &Path)` helper that writes `enrichment.parquet` with the exact production schema (7 columns: `entity_qid`, `entity_type`, `release_date`, `record_label_qid`, `duration_seconds`, `genre_qid`, `parent_album_qid`), mirroring the existing `write_test_genres_parquet` / `write_test_albums_tracks_parquet` helpers using `StringBuilder` / `ArrowWriter`.
+  2. Add `test_load_enrichment_album_genre_fk_guard` — writes two album rows (`entity_type='album'`): one with `genre_qid` that exists in the `genre` table, one with `genre_qid` that does not. Pre-populates the `genre` table (with the valid genre) and the `album` table (with the valid row's `entity_qid`). Asserts `album_genre` contains exactly the valid row (count = 1, correct `genre_id`).
+  3. Add `test_load_enrichment_track_album_fk_guard` — writes two track rows (`entity_type='track'`): one with `parent_album_qid` that exists in the `album` table, one that does not. Pre-populates the `album` table (with the valid `parent_album_qid`) and the `track` table (with the valid row's `entity_qid`). Asserts `track_album` contains exactly the valid row (count = 1, correct `album_id`).
+
+**Test strategy:** Unit tests — each test verifies both directions of one guard (valid row inserted, invalid row silently dropped).
+
+---
+
+### Step 4 — `chore: verify fix with full test suite and linters`
+
+**Rationale:** Run the full test suite, linters, and formatter to confirm the fix introduces no regressions. No code changes.
+
+**Deliverables:**
+
+- `cargo test` — all tests pass
 - `cargo clippy -- -D warnings` — no warnings
 - `cargo fmt --check` — formatting is clean
-- `cargo audit` — no known vulnerabilities
 
 **Commit:** None — verification step only.
