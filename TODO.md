@@ -1,27 +1,24 @@
-# Implementation Plan: Fix Backfill FK Violations with Temp-Table Swap
+# Implementation Plan: Fix FK Constraint Violation During artist.name Backfill
 
-Source: `docs/research/2026-08_fix_backfill_fk_safe_emptying.md`
+Source: `docs/research/2026-08_fix_artist_backfill_fk_violation.md`
 
 ## Context
 
-The `populate` subcommand fails with a DuckDB FK constraint violation when `UPDATE album SET name = ...` runs because `album_artist` and `track_artist` (populated during bootstrap) already contain child rows referencing `album(id)` and `track(id)`. DuckDB's RESTRICT enforcement fires on **all** parent-table UPDATEs — even non-key column updates — and the bundled version provides no working `PRAGMA foreign_keys = OFF`.
+The `populate` subcommand fails with a DuckDB FK constraint violation on the `UPDATE artist SET name = ...` statement. The prior fix (`backfill_all_safe`) only backs up and empties four child tables (`album_artist`, `track_artist`, `album_genre`, `track_album`), but three additional tables referencing `artist(id)` are not emptied: `artist_genre`, `artist_instrument`, `artist_member_of`. These three tables contain ~2.7M rows referencing artists with `name IS NULL` (577,504 artists), causing the FK violation.
 
-The fix wraps name and enrichment-field UPDATEs in a single transaction that temporarily backs up child-table rows to temp tables, DELETEs them from the child tables, runs all UPDATEs, then restores the rows. Since child-row deletion is always allowed, the UPDATEs proceed without FK violations.
-
-Two prior fix attempts are superseded (commits `b870d31` and `aaef0a3`). The old approach in those commits is replaced entirely.
+Additionally, the prior fix runs Phase 1 DELETEs outside the transaction (auto-committed), which permanently lost data on a failed run. The fix moves all DELETEs inside the transaction.
 
 | # | Commit message | Logical unit | Key deliverables | Tests |
 |---|---|---|---|---|
-| 1 | `fix(db): add FK-safe backfill with temp-table swap and remove dead code` | `backfill_all_safe` function | `src/db/load.rs` — new `backfill_all_safe()`, remove `backfill_names()`, `backfill_names_inner()`, `backfill_enrichment_fields()`, `backfill_enrichment_inner()` | Unit (2 tests) |
-| 2 | `fix(db): integrate FK-safe backfill into populate pipeline` | Pipeline orchestration | `src/db/load.rs` — `load_label_and_enrichment()` updated to call `backfill_all_safe()` | — |
+| 1 | `fix(db): add artist child tables to FK-safe backfill and fix transaction boundary` | Extend `backfill_all_safe` | `src/db/load.rs` — add 3 temp tables, move DELETEs inside transaction, add restore/drop for artist tables | Unit (existing tests updated) |
+| 2 | `test(db): add coverage for artist child tables in backfill and rollback` | Test coverage for artist tables | `src/db/load.rs` — update `test_backfill_all_safe_with_child_rows`, `test_backfill_all_safe_rollback_on_error`, add `test_backfill_all_safe_rollback_preserves_artist_tables` | Unit (3 tests) |
 | 3 | *(verification)* Run full test suite, linters, formatter | Verify | — | — |
-| 4 | *(operational)* Clean stale enrichment data and re-run populate | Populate verification | — | — |
 
 ## Step details
 
 ### Step 0 — Pre-work
 
-**Branch:** `agent/fix-backfill-album-name-fk`. Verify workspace clean and tests pass before starting.
+**Branch:** `agent/fix-artist-backfill-fk-violation`. Verify workspace clean and tests pass before starting.
 
 ```bash
 git status
@@ -30,46 +27,74 @@ cargo clippy -- -D warnings
 cargo fmt --check
 ```
 
-The research document `docs/research/2026-08_fix_backfill_fk_safe_emptying.md` is untracked — add it before the first commit.
+The research document `docs/research/2026-08_fix_artist_backfill_fk_violation.md` is untracked — add it before the first commit.
 
-### Step 1 — `fix(db): add FK-safe backfill with temp-table swap and remove dead code`
+### Step 1 — `fix(db): add artist child tables to FK-safe backfill and fix transaction boundary`
 
-**Rationale:** Replace the four backfill functions (`backfill_names`, `backfill_names_inner`, `backfill_enrichment_fields`, `backfill_enrichment_inner`) with a single `backfill_all_safe()` that atomically backs up child tables, empties them, runs all UPDATEs, and restores them within one transaction.
+**Rationale:** The prior fix's `backfill_all_safe` only handles four child tables referencing `album(id)` and `track(id)`. Three tables referencing `artist(id)` — `artist_genre`, `artist_instrument`, `artist_member_of` — are not emptied, causing the `UPDATE artist` to fail with FK violations. Additionally, the prior fix runs DELETEs outside the transaction (auto-committed), which permanently loses data on failure. This fix extends the backup/delete/restore cycle to cover all seven child tables and moves DELETEs inside the transaction.
 
 **Changes in `src/db/load.rs`:**
 
-1. **Add `backfill_all_safe(conn: &Connection, parquet_dir: &Path) -> Result<()>`:**
-   - `BEGIN TRANSACTION`
-   - Create temp tables: `CREATE TEMP TABLE _bak_album_artist AS SELECT * FROM album_artist` (repeat for `_bak_track_artist`, `_bak_album_genre`, `_bak_track_album`)
-   - `DELETE FROM` all four child tables (in reverse dependency order: `track_album`, `album_genre`, `track_artist`, `album_artist`)
-   - Run the three name UPDATEs from `backfill_names_inner` (album, track, artist)
-   - Run the three enrichment-field UPDATEs from `backfill_enrichment_inner` (release_date, record_label, duration_seconds) using `read_parquet('{enrichment_path}')`
-   - `INSERT INTO ... SELECT * FROM _bak_*` for all four child tables
-   - `DROP TABLE IF EXISTS _bak_*` for all four temp tables
-   - `COMMIT`
-   - On error: `ROLLBACK`, return the error
-   - Per-step `tracing::info!`/`tracing::debug!` calls matching the plan in §3.3
+1. **Add three new temp table creations in `backfill_all_safe`:**
+   - `CREATE TEMP TABLE IF NOT EXISTS _bak_artist_genre AS SELECT * FROM artist_genre`
+   - `CREATE TEMP TABLE IF NOT EXISTS _bak_artist_instrument AS SELECT * FROM artist_instrument`
+   - `CREATE TEMP TABLE IF NOT EXISTS _bak_artist_member_of AS SELECT * FROM artist_member_of`
 
-2. **Remove functions:** `backfill_names()`, `backfill_names_inner()`, `backfill_enrichment_fields()`, `backfill_enrichment_inner()`
+2. **Move the seven DELETE statements inside the transaction** (after `BEGIN TRANSACTION`, before `backfill_all_safe_inner`):
+   - `DELETE FROM track_album`
+   - `DELETE FROM album_genre`
+   - `DELETE FROM track_artist`
+   - `DELETE FROM album_artist`
+   - `DELETE FROM artist_member_of`
+   - `DELETE FROM artist_instrument`
+   - `DELETE FROM artist_genre`
 
-3. **Remove old test:** `test_backfill_with_active_fk_constraints` (tests the reordering approach, superseded)
+   Remove the four DELETEs from their current location (outside the transaction). The CREATE TEMP TABLE statements remain outside the transaction (temp tables are session-scoped, not transaction-scoped).
 
-4. **Add two new tests:**
+3. **Add three new restores and drops to `backfill_all_safe_inner`:**
+   - `INSERT INTO artist_genre SELECT * FROM _bak_artist_genre`
+   - `INSERT INTO artist_instrument SELECT * FROM _bak_artist_instrument`
+   - `INSERT INTO artist_member_of SELECT * FROM _bak_artist_member_of`
+   - `DROP TABLE IF EXISTS _bak_artist_genre`
+   - `DROP TABLE IF EXISTS _bak_artist_instrument`
+   - `DROP TABLE IF EXISTS _bak_artist_member_of`
 
-   - **`test_backfill_all_safe_with_child_rows`** — Pre-seed `qid_label`, populate `album` and `track` with Q-ID placeholders, insert rows into all four child tables (`album_artist`, `track_artist`, `album_genre`, `track_album`) with valid FK references, write a real `enrichment.parquet` with release_date/record_label/duration_seconds data, call `backfill_all_safe`, assert names and enrichment fields were updated, assert all four child-table row counts and FK integrity are preserved.
+4. **Update doc comments** on both `backfill_all_safe` and `backfill_all_safe_inner` to:
+   - Describe the full set of seven child tables
+   - Document the new transaction boundary (DELETEs inside the transaction)
+   - Remove the incorrect rationale about auto-committing Phase 1
 
-   - **`test_backfill_all_safe_rollback_on_error`** — Pre-seed data, set up child rows, create enrichment.parquet at a path that will cause an error (e.g., nonexistent enrichment path, or corrupt data), call `backfill_all_safe`, assert it returns an error, assert all child tables have their original row counts and parent-table names are unchanged (no partial state).
+5. **Run the existing test suite** — all existing tests must pass. The existing `test_backfill_all_safe_with_child_rows` and `test_backfill_all_safe_rollback_on_error` may fail or need updating (see Step 2).
 
-### Step 2 — `fix(db): integrate FK-safe backfill into populate pipeline`
+**Commit:** `fix(db): add artist child tables to FK-safe backfill and fix transaction boundary`
 
-**Rationale:** Wire the new `backfill_all_safe()` into `load_label_and_enrichment()` and update its doc comment to reflect the new pipeline order.
+### Step 2 — `test(db): add coverage for artist child tables in backfill and rollback`
 
-**Changes in `src/db/load.rs`, `load_label_and_enrichment()`:**
+**Rationale:** The existing tests only cover the four album/track child tables. New test coverage verifies the three artist child tables are preserved after backfill and survive rollback.
 
-1. Replace the two calls `backfill_names(conn, parquet_dir)?` and `backfill_enrichment_fields(conn, parquet_dir)?` with a single `backfill_all_safe(conn, parquet_dir)?`
-2. Update the doc comment to describe the temp-table swap approach:
-   - Step order: `load_labels` → `backfill_all_safe` → `load_enrichment` → `create_fts_indexes`
-   - Explain that child tables are temporarily emptied within a transaction to avoid FK violations
+**Changes in `src/db/load.rs` (tests module):**
+
+1. **Update `test_backfill_all_safe_with_child_rows`:**
+   - Add pre-seeded rows for `artist_genre`, `artist_instrument`, `artist_member_of` with valid FK references to `artist(id)`
+   - For `artist_member_of`, include a row where both `artist_id` and `group_id` reference valid artists (exercises the self-referencing FK edge case)
+   - Assert row counts are preserved after backfill for all seven child tables
+   - Add FK integrity checks for all seven child tables (not just the four current ones)
+
+2. **Update `test_backfill_all_safe_rollback_on_error`:**
+   - After moving Phase 1 DELETEs inside the transaction, a rollback should preserve child-table rows
+   - Remove the assertion that accepts empty child tables as expected behavior
+   - Add assertions that `album_artist` rows are intact after rollback
+   - Add similar assertions for artist child tables (`artist_genre`, `artist_instrument`, `artist_member_of`)
+   - The temp table backup assertion (`_bak_album_artist`) should be updated to verify all seven temp tables hold backup data
+
+3. **Add `test_backfill_all_safe_rollback_preserves_artist_tables`:**
+   - A focused test that specifically validates the gap from the prior fix
+   - Pre-seed `artist_genre`, `artist_instrument`, and `artist_member_of` with rows referencing valid artists
+   - Trigger a rollback (e.g., missing `enrichment.parquet`)
+   - Assert all row counts are preserved in the three artist child tables
+   - Assert FK integrity holds for all three tables
+
+**Commit:** `test(db): add coverage for artist child tables in backfill and rollback`
 
 ### Step 3 — Verify
 
@@ -81,26 +106,23 @@ cargo clippy -- -D warnings
 cargo fmt --check
 ```
 
-If the old `test_backfill_with_active_fk_constraints` was removed properly, no tests should reference the old functions. If the new tests exercise all four child tables with real enrichment data, the FK-safe approach is validated.
+Expected test results:
 
-### Step 4 — Re-run populate (operational)
+- `test_backfill_all_safe_with_child_rows` — now asserts all 7 child tables preserved
+- `test_backfill_all_safe_rollback_on_error` — now asserts child rows preserved after rollback
+- `test_backfill_all_safe_rollback_preserves_artist_tables` (new) — passes
 
-**Rationale:** Verify the fix works on production data. Prior failed runs left stale enrichment data that must be cleared first.
+### Post-implementation: Operational recovery
+
+After the fix is committed, recover the permanently lost `album_artist` and `track_artist` rows by re-bootstrapping:
 
 ```bash
-# Clear stale enrichment data from the failed run
-duckdb /home/tr/wiki_db/music.duckdb -c "
-DELETE FROM album_genre;
-DELETE FROM track_album;
-DELETE FROM record_label;
-DELETE FROM instrument;
-"
-
-# Re-run with --resume to reuse existing Parquet files
+rm /home/tr/wiki_db/music.duckdb
+rm -f parquet-dir/labels.parquet parquet-dir/enrichment.parquet
+cargo run --release -- bootstrap \
+  --db /home/tr/wiki_db/music.duckdb \
+  --dump /home/tr/wiki_db/latest-all.json.gz
 cargo run --release -- populate \
   --db /home/tr/wiki_db/music.duckdb \
-  --dump /home/tr/wiki_db/latest-all.json.gz \
-  --resume
+  --dump /home/tr/wiki_db/latest-all.json.gz
 ```
-
-Expected outcome: `backfill_all_safe` completes without FK errors, enrichment loads, FTS indexes rebuilt, summary shown. After completion, run the FK integrity queries from §4.2 of the research plan — all should return 0.
