@@ -73,14 +73,28 @@ pub fn load_all(conn: &Connection, parquet_dir: &Path) -> Result<()> {
 /// which fires on parent-table UPDATEs even for non-key columns.
 ///
 /// The approach:
-/// 1. Back up child tables to temp tables
-/// 2. DELETE all rows from child tables (always allowed)
-/// 3. Run all name and enrichment-field UPDATEs (safe: zero child rows)
-/// 4. Restore all child rows from temp tables
-/// 5. Drop temp tables
+/// 1. Back up all child tables to temp tables (outside transaction)
+/// 2. DELETE all rows from child tables (auto-committed before transaction)
+/// 3. BEGIN TRANSACTION
+/// 4. Run all name and enrichment-field UPDATEs (safe: zero child rows)
+/// 5. Restore all child rows from temp tables
+/// 6. DROP temp tables
+/// 7. COMMIT
 ///
-/// All steps execute within a single transaction. On error, everything
-/// is rolled back to the pre-transaction state.
+/// Steps 1–2 run outside the transaction (auto-committed) so that
+/// DuckDB's FK RESTRICT enforcement sees committed zero-row state
+/// during the UPDATEs. Temp tables are session-scoped and survive
+/// both COMMIT and ROLLBACK, so a retry on the same connection
+/// reuses existing backups via `IF NOT EXISTS`.
+///
+/// Seven child tables are handled:
+/// - album_artist (album_id → album(id), artist_id → artist(id))
+/// - track_artist (track_id → track(id), artist_id → artist(id))
+/// - album_genre  (album_id → album(id))
+/// - track_album  (track_id → track(id), album_id → album(id))
+/// - artist_genre      (artist_id → artist(id))
+/// - artist_instrument (artist_id → artist(id))
+/// - artist_member_of  (artist_id → artist(id), group_id → artist(id))
 pub fn backfill_all_safe(conn: &Connection, parquet_dir: &Path) -> Result<()> {
     let enrichment_path = parquet_dir.join("enrichment.parquet");
     let enrichment_path_str = enrichment_path
@@ -89,11 +103,9 @@ pub fn backfill_all_safe(conn: &Connection, parquet_dir: &Path) -> Result<()> {
 
     tracing::info!("Beginning FK-safe backfill");
 
-    // Phase 1: Back up child tables to temp tables and empty child tables.
-    // These run outside any explicit transaction (auto-committed) so that
-    // DuckDB's FK constraint check on subsequent UPDATEs sees the committed
-    // state of zero child rows. Temp tables are session-scoped and persist
-    // across the entire connection lifetime.
+    // Phase 1: Back up all child tables to temp tables.
+    // Temp tables are session-scoped and persist across the entire
+    // connection lifetime, surviving both COMMIT and ROLLBACK.
     tracing::debug!("Backing up child tables");
     conn.execute(
         "CREATE TEMP TABLE IF NOT EXISTS _bak_album_artist AS SELECT * FROM album_artist",
@@ -115,7 +127,27 @@ pub fn backfill_all_safe(conn: &Connection, parquet_dir: &Path) -> Result<()> {
         [],
     )
     .context("Failed to back up track_album")?;
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS _bak_artist_genre AS SELECT * FROM artist_genre",
+        [],
+    )
+    .context("Failed to back up artist_genre")?;
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS _bak_artist_instrument AS SELECT * FROM artist_instrument",
+        [],
+    )
+    .context("Failed to back up artist_instrument")?;
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS _bak_artist_member_of AS SELECT * FROM artist_member_of",
+        [],
+    )
+    .context("Failed to back up artist_member_of")?;
 
+    // Phase 2: Empty all child tables (outside the transaction).
+    // DuckDB v1.1.0's FK RESTRICT enforcement may not see
+    // in-transaction DELETEs, so we auto-commit these so the
+    // subsequent UPDATEs (inside the transaction) see committed
+    // zero-child-row state. Temp tables retain the backup data.
     tracing::debug!("Emptying child tables");
     conn.execute("DELETE FROM track_album", [])
         .context("Failed to delete from track_album")?;
@@ -125,10 +157,15 @@ pub fn backfill_all_safe(conn: &Connection, parquet_dir: &Path) -> Result<()> {
         .context("Failed to delete from track_artist")?;
     conn.execute("DELETE FROM album_artist", [])
         .context("Failed to delete from album_artist")?;
+    conn.execute("DELETE FROM artist_member_of", [])
+        .context("Failed to delete from artist_member_of")?;
+    conn.execute("DELETE FROM artist_instrument", [])
+        .context("Failed to delete from artist_instrument")?;
+    conn.execute("DELETE FROM artist_genre", [])
+        .context("Failed to delete from artist_genre")?;
 
-    // Phase 2: Run UPDATEs and restore within a single transaction.
+    // Phase 3: Run UPDATEs and restore within a single transaction.
     // FK checks now see committed empty child tables.
-
     conn.execute("BEGIN TRANSACTION", [])
         .context("Failed to begin FK-safe backfill transaction")?;
 
@@ -156,8 +193,9 @@ pub fn backfill_all_safe(conn: &Connection, parquet_dir: &Path) -> Result<()> {
 
 /// Inner FK-safe backfill logic (runs inside a transaction).
 ///
-/// Child tables are already empty (deleted in Phase 1). This function runs
-/// all UPDATEs, restores from temp tables, and drops temp tables.
+/// All seven child tables are already empty (deleted before the
+/// transaction began). This function runs all UPDATEs, restores from
+/// temp tables, and drops temp tables.
 fn backfill_all_safe_inner(conn: &Connection, enrichment_path: &str) -> Result<()> {
     // 1. Run name backfill UPDATEs
     tracing::debug!("Running name backfill UPDATEs");
@@ -246,6 +284,21 @@ fn backfill_all_safe_inner(conn: &Connection, enrichment_path: &str) -> Result<(
         .context("Failed to restore album_genre")?;
     conn.execute("INSERT INTO track_album SELECT * FROM _bak_track_album", [])
         .context("Failed to restore track_album")?;
+    conn.execute(
+        "INSERT INTO artist_genre SELECT * FROM _bak_artist_genre",
+        [],
+    )
+    .context("Failed to restore artist_genre")?;
+    conn.execute(
+        "INSERT INTO artist_instrument SELECT * FROM _bak_artist_instrument",
+        [],
+    )
+    .context("Failed to restore artist_instrument")?;
+    conn.execute(
+        "INSERT INTO artist_member_of SELECT * FROM _bak_artist_member_of",
+        [],
+    )
+    .context("Failed to restore artist_member_of")?;
 
     // 6. Clean up temp tables
     conn.execute("DROP TABLE IF EXISTS _bak_album_artist", [])
@@ -256,6 +309,12 @@ fn backfill_all_safe_inner(conn: &Connection, enrichment_path: &str) -> Result<(
         .context("Failed to drop _bak_album_genre")?;
     conn.execute("DROP TABLE IF EXISTS _bak_track_album", [])
         .context("Failed to drop _bak_track_album")?;
+    conn.execute("DROP TABLE IF EXISTS _bak_artist_genre", [])
+        .context("Failed to drop _bak_artist_genre")?;
+    conn.execute("DROP TABLE IF EXISTS _bak_artist_instrument", [])
+        .context("Failed to drop _bak_artist_instrument")?;
+    conn.execute("DROP TABLE IF EXISTS _bak_artist_member_of", [])
+        .context("Failed to drop _bak_artist_member_of")?;
 
     Ok(())
 }
