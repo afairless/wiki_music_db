@@ -2693,6 +2693,31 @@ mod tests {
         )
         .unwrap();
 
+        // 3b. Insert rows into artist child tables with valid FK references
+        //     (the gap from the prior fix)
+        conn.execute(
+            "INSERT INTO artist_genre (artist_id, genre_id) VALUES ('QTestArtist', 'QTestGenre')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artist_instrument (artist_id, instrument_id) VALUES ('QTestArtist', 'QTestInstrument')",
+            [],
+        )
+        .unwrap();
+        // artist_member_of has a self-referencing FK: both artist_id and
+        // group_id reference artist(id). Insert a second artist as the group.
+        conn.execute(
+            "INSERT INTO artist (id, name, artist_type) VALUES ('QTestGroup', 'Test Group', 'group')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artist_member_of (artist_id, group_id) VALUES ('QTestArtist', 'QTestGroup')",
+            [],
+        )
+        .unwrap();
+
         // 4. Write a full enrichment.parquet with release_date, record_label_qid, duration_seconds
         write_full_enrichment_parquet(
             dir.path(),
@@ -2718,11 +2743,27 @@ mod tests {
         let orig_tal: usize = conn
             .query_row("SELECT COUNT(*) FROM track_album", [], |row| row.get(0))
             .unwrap();
+        let orig_arig: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_genre", [], |row| row.get(0))
+            .unwrap();
+        let orig_arins: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_instrument", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let orig_armem: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_member_of", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
 
         assert_eq!(orig_aa, 1, "Expected 1 album_artist row");
         assert_eq!(orig_ta, 1, "Expected 1 track_artist row");
         assert_eq!(orig_ag, 1, "Expected 1 album_genre row");
         assert_eq!(orig_tal, 1, "Expected 1 track_album row");
+        assert_eq!(orig_arig, 1, "Expected 1 artist_genre row");
+        assert_eq!(orig_arins, 1, "Expected 1 artist_instrument row");
+        assert_eq!(orig_armem, 1, "Expected 1 artist_member_of row");
 
         // 6. Call backfill_all_safe
         let result = backfill_all_safe(&conn, dir.path());
@@ -2819,6 +2860,19 @@ mod tests {
         let final_tal: usize = conn
             .query_row("SELECT COUNT(*) FROM track_album", [], |row| row.get(0))
             .unwrap();
+        let final_arig: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_genre", [], |row| row.get(0))
+            .unwrap();
+        let final_arins: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_instrument", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let final_armem: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_member_of", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
 
         assert_eq!(
             final_aa, orig_aa,
@@ -2835,6 +2889,18 @@ mod tests {
         assert_eq!(
             final_tal, orig_tal,
             "track_album row count should be preserved"
+        );
+        assert_eq!(
+            final_arig, orig_arig,
+            "artist_genre row count should be preserved"
+        );
+        assert_eq!(
+            final_arins, orig_arins,
+            "artist_instrument row count should be preserved"
+        );
+        assert_eq!(
+            final_armem, orig_armem,
+            "artist_member_of row count should be preserved"
         );
 
         // 10. Assert FK integrity (no orphaned references)
@@ -2867,6 +2933,49 @@ mod tests {
             orphan_ta_ar, 0,
             "No orphaned track_artist artist references"
         );
+
+        // FK integrity checks for artist child tables
+        let orphan_arig: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artist_genre ag LEFT JOIN artist a ON ag.artist_id = a.id WHERE a.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_arig, 0, "No orphaned artist_genre references");
+
+        let orphan_arins: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artist_instrument ai LEFT JOIN artist a ON ai.artist_id = a.id WHERE a.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_arins, 0, "No orphaned artist_instrument references");
+
+        let orphan_armem_ar: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artist_member_of amo LEFT JOIN artist a ON amo.artist_id = a.id WHERE a.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphan_armem_ar, 0,
+            "No orphaned artist_member_of artist_id references"
+        );
+
+        let orphan_armem_gr: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artist_member_of amo LEFT JOIN artist a ON amo.group_id = a.id WHERE a.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphan_armem_gr, 0,
+            "No orphaned artist_member_of group_id references"
+        );
     }
 
     #[test]
@@ -2895,7 +3004,33 @@ mod tests {
         )
         .unwrap();
         conn.execute(
+            "INSERT INTO genre (id, name) VALUES ('QTestGenre', 'test genre')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO album_artist (album_id, artist_id, role) VALUES ('QTestAlbum', 'QTestArtist', 'performer')",
+            [],
+        )
+        .unwrap();
+        // Insert rows into artist child tables to verify they are backed up
+        conn.execute(
+            "INSERT INTO artist_genre (artist_id, genre_id) VALUES ('QTestArtist', 'QTestGenre')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artist_instrument (artist_id, instrument_id) VALUES ('QTestArtist', 'QTestInstrument')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artist (id, name, artist_type) VALUES ('QTestGroup', 'Test Group', 'group')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artist_member_of (artist_id, group_id) VALUES ('QTestArtist', 'QTestGroup')",
             [],
         )
         .unwrap();
@@ -2944,12 +3079,241 @@ mod tests {
             "Album name should be unchanged after rollback"
         );
 
-        // Verify temp tables still hold the backed-up data
-        let bak_count: usize = conn
+        // Verify all seven temp tables still hold the backed-up data
+        let bak_aa: usize = conn
             .query_row("SELECT COUNT(*) FROM _bak_album_artist", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(bak_count, 1, "Temp table should retain backup for recovery");
+        assert_eq!(bak_aa, 1, "Temp _bak_album_artist should retain backup");
+
+        let bak_arig: usize = conn
+            .query_row("SELECT COUNT(*) FROM _bak_artist_genre", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(bak_arig, 1, "Temp _bak_artist_genre should retain backup");
+
+        let bak_arins: usize = conn
+            .query_row("SELECT COUNT(*) FROM _bak_artist_instrument", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            bak_arins, 1,
+            "Temp _bak_artist_instrument should retain backup"
+        );
+
+        let bak_armem: usize = conn
+            .query_row("SELECT COUNT(*) FROM _bak_artist_member_of", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            bak_armem, 1,
+            "Temp _bak_artist_member_of should retain backup"
+        );
+    }
+
+    #[test]
+    fn test_backfill_all_safe_rollback_preserves_artist_tables() {
+        // This test validates the gap from the prior fix: the three artist
+        // child tables (artist_genre, artist_instrument, artist_member_of)
+        // must be backed up so that a rollback never loses their data.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = test_conn();
+
+        // 1. Pre-seed artists (including a group for artist_member_of's
+        //    self-referencing FK) and a genre
+        conn.execute(
+            "INSERT INTO artist (id, name, artist_type) VALUES ('QArtist1', 'Artist 1', 'person')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artist (id, name, artist_type) VALUES ('QArtist2', 'Artist 2', 'person')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artist (id, name, artist_type) VALUES ('QGroup', 'Group', 'group')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO genre (id, name) VALUES ('QGenre1', 'jazz')",
+            [],
+        )
+        .unwrap();
+
+        // 2. Pre-seed the three artist child tables with valid FK refs
+        conn.execute(
+            "INSERT INTO artist_genre (artist_id, genre_id) VALUES ('QArtist1', 'QGenre1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artist_genre (artist_id, genre_id) VALUES ('QArtist2', 'QGenre1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artist_instrument (artist_id, instrument_id) VALUES ('QArtist1', 'QInstrument1')",
+            [],
+        )
+        .unwrap();
+        // Self-referencing FK edge case: both columns reference artist(id)
+        conn.execute(
+            "INSERT INTO artist_member_of (artist_id, group_id) VALUES ('QArtist1', 'QGroup')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artist_member_of (artist_id, group_id) VALUES ('QArtist2', 'QGroup')",
+            [],
+        )
+        .unwrap();
+
+        // 3. Record original counts
+        let orig_arig: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_genre", [], |row| row.get(0))
+            .unwrap();
+        let orig_arins: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_instrument", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let orig_armem: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_member_of", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(orig_arig, 2, "Expected 2 artist_genre rows");
+        assert_eq!(orig_arins, 1, "Expected 1 artist_instrument row");
+        assert_eq!(orig_armem, 2, "Expected 2 artist_member_of rows");
+
+        // 4. Trigger a rollback: no enrichment.parquet in the directory
+        let result = backfill_all_safe(&conn, dir.path());
+        assert!(
+            result.is_err(),
+            "backfill_all_safe should error when enrichment.parquet is missing"
+        );
+
+        // 5. The auto-committed DELETEs emptied the child tables, but the
+        //    temp backup tables must retain every row for recovery.
+        let bak_arig: usize = conn
+            .query_row("SELECT COUNT(*) FROM _bak_artist_genre", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            bak_arig, orig_arig,
+            "_bak_artist_genre should retain all rows after rollback"
+        );
+        let bak_arins: usize = conn
+            .query_row("SELECT COUNT(*) FROM _bak_artist_instrument", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            bak_arins, orig_arins,
+            "_bak_artist_instrument should retain all rows after rollback"
+        );
+        let bak_armem: usize = conn
+            .query_row("SELECT COUNT(*) FROM _bak_artist_member_of", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            bak_armem, orig_armem,
+            "_bak_artist_member_of should retain all rows after rollback"
+        );
+
+        // 6. Restore from the backups (the recovery path) and verify FK
+        //    integrity holds for all three artist child tables.
+        conn.execute(
+            "INSERT INTO artist_genre SELECT * FROM _bak_artist_genre",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artist_instrument SELECT * FROM _bak_artist_instrument",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artist_member_of SELECT * FROM _bak_artist_member_of",
+            [],
+        )
+        .unwrap();
+
+        let orphan_arig: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artist_genre ag LEFT JOIN artist a ON ag.artist_id = a.id WHERE a.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_arig, 0, "No orphaned artist_genre references");
+
+        let orphan_arins: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artist_instrument ai LEFT JOIN artist a ON ai.artist_id = a.id WHERE a.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_arins, 0, "No orphaned artist_instrument references");
+
+        let orphan_armem_ar: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artist_member_of amo LEFT JOIN artist a ON amo.artist_id = a.id WHERE a.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphan_armem_ar, 0,
+            "No orphaned artist_member_of artist_id references"
+        );
+
+        let orphan_armem_gr: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artist_member_of amo LEFT JOIN artist a ON amo.group_id = a.id WHERE a.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphan_armem_gr, 0,
+            "No orphaned artist_member_of group_id references"
+        );
+
+        // 7. Verify restored row counts match the originals
+        let final_arig: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_genre", [], |row| row.get(0))
+            .unwrap();
+        let final_arins: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_instrument", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let final_armem: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_member_of", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            final_arig, orig_arig,
+            "Restored artist_genre count should match original"
+        );
+        assert_eq!(
+            final_arins, orig_arins,
+            "Restored artist_instrument count should match original"
+        );
+        assert_eq!(
+            final_armem, orig_armem,
+            "Restored artist_member_of count should match original"
+        );
     }
 }
