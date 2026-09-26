@@ -1,7 +1,10 @@
 # Research: Fix FK Constraint Violation During artist.name Backfill
 
 **Date:** 2026-08-06
-**Status:** Plan
+**Status:** Implemented
+**Implemented:** 2026-08 — closes with commits `1793ec0` (artist child tables in FK-safe backfill) + `a8495b2` (backfill/rollback tests) — see git log.
+
+*Status updated per the [documentation conventions in AGENTS.md](../../AGENTS.md) — implemented plans carry `Status: Implemented` with their closing commits.*
 **References:**
 
 - [2026-08_fix_backfill_fk_safe_emptying.md](./2026-08_fix_backfill_fk_safe_emptying.md) — prior fix (the one with the gap)

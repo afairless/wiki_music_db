@@ -1,7 +1,10 @@
 # Research: Fix Backfill FK Violations by Temporarily Emptying Child Tables
 
 **Date:** 2026-08-06
-**Status:** Plan
+**Status:** Implemented
+**Implemented:** 2026-08 — closes with commits `989d133` (plan) + `1094283` (FK-safe backfill with temp-table swap) — see git log.
+
+*Status updated per the [documentation conventions in AGENTS.md](../../AGENTS.md) — implemented plans carry `Status: Implemented` with their closing commits.*
 **References:**
 
 - [2026-08_fix_backfill_album_name_fk_violation.md](./2026-08_fix_backfill_album_name_fk_violation.md) — prior fix attempts (PRAGMA, then reordering)

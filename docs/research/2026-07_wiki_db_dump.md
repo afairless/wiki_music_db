@@ -1,3 +1,6 @@
+> **Adopted 2026-07:** Option 3 / Approach A (the Wikidata JSON dump). See the
+> [Rust implementation plan](./2026-07_music_db_rust_plan.md) for the adopted design.
+
 Building a local offline database of structured data (like musicians, genres, birth/death dates) from Wikipedia dumps is a classic problem.
 
 To answer your direct questions: **No, you shouldn't download a full raw Wikipedia XML text dump (Option 1) or attempt manual two-stage indexing (Option 2) if your goal is structured metadata.** Parsing Wikipedia's wikitext infoboxes is notoriously brittle because infobox template keys vary wildly (e.g., `birth_date`, `born`, `date_of_birth`, or nested templates like `{{birth date and age|1958|8|16}}`).

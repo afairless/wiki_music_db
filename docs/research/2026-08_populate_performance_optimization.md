@@ -1,7 +1,10 @@
 # Research: Populate Substring Pre-Check Performance Optimization
 
 **Date:** 2026-08-05
-**Status:** Plan
+**Status:** Implemented
+**Implemented:** 2026-08 — closes with commits `041c9a0` (aho-corasick dep) + `0392d4b` (Aho-Corasick substring scan) — see git log.
+
+*Status updated per the [documentation conventions in AGENTS.md](../../AGENTS.md) — implemented plans carry `Status: Implemented` with their closing commits.*
 **References:**
 
 - [2026-08_populate_names_research.md](./2026-08_populate_names_research.md) — original populate design & implementation

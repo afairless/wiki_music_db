@@ -1,8 +1,11 @@
 # Research: Populating Album, Track, and Other Name Columns
 
 **Date:** 2026-08-02
-**Status:** Reviewed / Plan
+**Status:** Implemented
+**Implemented:** 2026-08 — closes with commits `de272d0`, `9c6e940`, `82a1771`, `cd5c71c` (populate subcommand), and `0392d4b` (Aho-Corasick perf) — see git log.
 **Reviewed:** 2026-08-02 — see [review notes](#12-review-findings)
+
+*Status updated per the [documentation conventions in AGENTS.md](../../AGENTS.md) — implemented plans carry `Status: Implemented` with their closing commits.*
 **References:**
 
 - [ARCHITECTURE.md](../ARCHITECTURE.md) — full schema, pipeline, and design decisions

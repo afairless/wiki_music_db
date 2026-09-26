@@ -1,7 +1,10 @@
 # Research: Fix Foreign Key Constraint Violations in Enrichment Loading
 
 **Date:** 2026-08-06
-**Status:** Plan
+**Status:** Implemented
+**Implemented:** 2026-08 — closes with commits `0f67175` (album_genre FK guard) + `34207d4` (track_album FK guard) — see git log.
+
+*Status updated per the [documentation conventions in AGENTS.md](../../AGENTS.md) — implemented plans carry `Status: Implemented` with their closing commits.*
 **References:**
 
 - [2026-08_populate_names_research.md](./2026-08_populate_names_research.md) — original populate design & implementation

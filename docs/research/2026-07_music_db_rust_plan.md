@@ -2,6 +2,7 @@
 
 **Date:** 2026-07-24  
 **Status:** Implementation Plan  
+**Status note (2026-09):** Phases 1–8 are complete and shipped. The populate/name-resolution phase was added after Phase 8 — see [2026-08_populate_names_research.md](./2026-08_populate_names_research.md).
 **References:**
 
 - [2026-07_music_db_options.md](./2026-07_music_db_options.md) — research & design options

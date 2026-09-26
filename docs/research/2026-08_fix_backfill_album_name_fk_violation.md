@@ -1,7 +1,10 @@
 # Research: DuckDB FK Violation During album.name Backfill
 
 **Date:** 2026-08-06
-**Status:** Plan
+**Status:** Implemented
+**Implemented:** 2026-08 — closes with commits `b870d31` (FK-enforcement-off workaround) + `1094283` (FK-safe backfill via temp-table swap) — see git log.
+
+*Status updated per the [documentation conventions in AGENTS.md](../../AGENTS.md) — implemented plans carry `Status: Implemented` with their closing commits.*
 **References:**
 
 - [`src/db/load.rs`](../../src/db/load.rs) — `backfill_names()` / `backfill_names_inner()`

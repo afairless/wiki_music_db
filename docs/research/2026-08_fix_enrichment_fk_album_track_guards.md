@@ -1,7 +1,10 @@
 # Research: Fix Missing FK Guards for album_genre.album_id and track_album.track_id
 
 **Date:** 2026-08-06
-**Status:** Plan
+**Status:** Implemented
+**Implemented:** 2026-08 — closes with commits `33eef88` (album/track FK guards) + `ea66274` (guard tests) — see git log.
+
+*Status updated per the [documentation conventions in AGENTS.md](../../AGENTS.md) — implemented plans carry `Status: Implemented` with their closing commits.*
 **References:**
 
 - [2026-08_fix_enrichment_fk_constraints.md](./2026-08_fix_enrichment_fk_constraints.md) — prior fix (applied; only addressed genre_id and parent_album_id)
