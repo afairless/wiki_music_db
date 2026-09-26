@@ -1,7 +1,8 @@
 # Research: Sync README, ARCHITECTURE, and AGENTS with Current Codebase State
 
 **Date:** 2026-09
-**Status:** Plan
+**Status:** Implemented
+**Implemented:** 2026-09 — closes with commits `32c4f0f` (README), `700e7ad` (ARCHITECTURE), `9c9ff28` (AGENTS), `c03482b` (research statuses) — see git log.
 **References:**
 
 - [ARCHITECTURE.md](../ARCHITECTURE.md) — architecture document in need of refresh
