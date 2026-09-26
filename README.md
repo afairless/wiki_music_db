@@ -10,7 +10,10 @@ Streams the ~35 GB gzipped Wikidata JSON dump, filters to musical acts & artists
 
 - **Streaming ingestion**: Line-by-line gzip decompression — memory usage stays bounded regardless of dump size
 - **Smart filtering**: Multi-criteria music entity detection (occupation, group type, catch-all properties)
-- **Normalized schema**: 12-table relational database with artists, genres, albums, tracks, instruments, and group membership
+- **Normalized schema**: 16-table relational database with artists, genres, albums, tracks, instruments, group membership, and Q-ID label lookups
+- **Full-text search**: DuckDB `fts` extension powers fast, unified search across artists, albums, genres, and tracks
+- **Incremental updates**: `update` merges entities changed since the last sync via the Wikidata SPARQL endpoint and Wikimedia REST API
+- **Name resolution**: `populate` resolves Q-ID name placeholders and fills in release dates, record labels, and track durations
 - **Resumable**: `--resume` flag skips already-written intermediate files for interrupted runs
 - **Idempotent**: `INSERT OR IGNORE` throughout — re-running produces identical database state
 - **Intermediate Parquet**: Filtered data is written to columnar Parquet files before database loading, enabling independent testing and resumability
@@ -34,7 +37,8 @@ cargo build --release
 ### Pipeline
 
 > **Note**: Running a full bootstrap takes 30-60 minutes and requires ~50 GB of
-> free disk space.  The next two commands are all you need for a complete build.
+> free disk space.  The next three commands are all you need for a complete build:
+> download, bootstrap, and populate.
 
 **Step 1 — Download** the Wikidata dump (resumable, ~35 GB):
 
@@ -42,13 +46,22 @@ cargo build --release
 cargo run -- download
 ```
 
-**Step 2 — Import** into DuckDB (takes 30-60 minutes on a modern CPU):
+**Step 2 — Bootstrap** the database from the dump (takes 30-60 minutes on a modern CPU):
 
 ```bash
 cargo run --release -- bootstrap
 ```
 
-That's it.  By default the dump lands as `latest-all.json.gz` in the current
+**Step 3 — Resolve names** (optional but recommended).  After bootstrap,
+`album.name` and `track.name` are Q-ID placeholders (e.g., `Q1636124`) and
+`release_date`, `record_label`, and `duration_seconds` are NULL.  `populate`
+re-scans the dump and replaces the placeholders with real English labels:
+
+```bash
+cargo run --release -- populate
+```
+
+That's the complete build.  By default the dump lands as `latest-all.json.gz` in the current
 directory, the DuckDB database is created as `music.duckdb`, and intermediate
 Parquet files are kept under `parquet-dir/`.  All of these paths can be
 customised through `wiki_db.toml` (see below).
@@ -58,6 +71,7 @@ Customising paths via CLI flags is also supported:
 ```bash
 cargo run -- download --output /data/dump.json.gz
 cargo run --release -- bootstrap --dump /data/dump.json.gz --db /data/music.duckdb
+cargo run --release -- populate --dump /data/dump.json.gz --db /data/music.duckdb
 ```
 
 ---
@@ -65,7 +79,7 @@ cargo run --release -- bootstrap --dump /data/dump.json.gz --db /data/music.duck
 ## Configuration
 
 Set all your defaults in a single `wiki_db.toml` file so you don't need to
-repeat CLI flags.  Place it in the project root and run the two commands above
+repeat CLI flags.  Place it in the project root and run the commands above
 as-is — they'll pick up the configured paths automatically.
 
 ```toml
@@ -75,14 +89,14 @@ as-is — they'll pick up the configured paths automatically.
 
 # ---------- Download & bootstrap paths --------------------------------------
 
-dump = "~/wiki_db/latest-all.json.gz"       # download and bootstrap both use this
-# db = "~/wiki_db/music.duckdb"              # bootstrap output (default: music.duckdb)
+dump = "~/wiki_db/latest-all.json.gz"       # download, bootstrap, and populate use this
+# db = "~/wiki_db/music.duckdb"              # bootstrap/query/update/populate output (default: music.duckdb)
 # parquet_dir = "~/wiki_db/parquet-dir"      # intermediate files (default: parquet-dir)
 
 # ---------- Behaviour flags -------------------------------------------------
 
 # cleanup_parquet = true                     # delete Parquet files after load
-# resume = false                             # skip completed Parquet on re-run
+# resume = false                             # skip completed Parquet on re-run (bootstrap, populate)
 
 # ---------- Logging ---------------------------------------------------------
 
@@ -119,16 +133,36 @@ By default the tool looks for `wiki_db.toml` in the current directory.
 
 | Field | Type | Default | CLI override | Used by |
 |---|---|---|---|---|
-| `dump` | string | — | `--dump` / `--output` | `download`, `bootstrap` |
-| `db` | string | `music.duckdb` | `--db` | `bootstrap` |
-| `parquet_dir` | string | `parquet-dir` | `--parquet-dir` | `bootstrap` |
+| `dump` | string | — | `--dump` / `--output` | `download`, `bootstrap`, `populate` |
+| `db` | string | `music.duckdb` | `--db` | `bootstrap`, `query`, `update`, `populate` |
+| `parquet_dir` | string | `parquet-dir` | `--parquet-dir` | `bootstrap`, `populate` |
 | `cleanup_parquet` | bool | `false` | `--cleanup-parquet` | `bootstrap` |
-| `resume` | bool | `false` | `--resume` | `bootstrap` |
+| `resume` | bool | `false` | `--resume` | `bootstrap`, `populate` |
 | `log_level` | string | `info` | `RUST_LOG` env var | all |
+
+#### `[download]` subsection
+
+| Field | Type | Default | CLI override | Used by |
+|---|---|---|---|---|
+| `url` | string | — | — | `download` |
+| `output` | string | — | `--output` | `download` |
+| `user_agent` | string | — | — | `download` |
+| `quiet` | bool | `false` | `--quiet` | `download` |
+
+#### `[update]` subsection
+
+| Field | Type | Default | CLI override | Used by |
+|---|---|---|---|---|
+| `since` | string | — | `--since` | `update` |
+| `dry_run` | bool | `false` | `--dry-run` | `update` |
+
+These subsections are accepted by the config loader for the corresponding
+subcommands.  CLI flags remain authoritative — pass them on the command line to
+override the file values.
 
 ---
 
-## Pipeline: Download → Import
+## Pipeline: Download → Bootstrap → Populate → Query
 
 ### Step 1 — Download the Wikidata dump
 
@@ -168,7 +202,24 @@ cargo run --release -- bootstrap \
 cargo run --release -- bootstrap --resume
 ```
 
-### Step 3 — Query the database
+### Step 3 — Populate names, dates, and labels
+
+```bash
+cargo run --release -- populate
+```
+
+After bootstrap, `album.name` and `track.name` hold Q-ID placeholders (e.g.,
+`Q1636124`) and `release_date`, `record_label`, and `duration_seconds` are NULL.
+`populate` re-scans the dump, resolves real English labels, and fills in those
+columns.  It can be skipped if you only care about artists, or if names are
+already resolved (re-runs exit with a message and change nothing).
+
+```bash
+# Re-run populate against a different database or dump
+cargo run --release -- populate --dump /tmp/dump.json.gz --db /tmp/experiment.duckdb
+```
+
+### Step 4 — Query the database
 
 ```bash
 # Search for an artist by name
@@ -186,9 +237,10 @@ cargo run --release -- query search --term "Miles"
 
 Query results are displayed in a formatted terminal output with colored headers.
 Artists show their genres, albums, instruments, and dates. Albums show their
-artist line-up, genre tags, and full track listing with durations.
+artist line-up, genre tags, and full track listing with durations — once
+`populate` (Step 3) has resolved track names.
 
-### Step 4 — Incremental update
+### Step 5 — Incremental update
 
 ```bash
 # Fetch and merge recent changes from Wikidata
@@ -231,6 +283,25 @@ Options:
   --resume               Skip already-written Parquet files to resume interrupted run
   --config <PATH>        TOML config file (default: wiki_db.toml)
 ```
+
+### `populate` — Resolve names, dates, and labels
+
+```
+cargo run -- populate [OPTIONS]
+
+Options:
+  -d, --dump <PATH>      Path to the Wikidata JSON dump (gzipped) (from wiki_db.toml or required)
+  --db <PATH>            Path to the DuckDB database (default: music.duckdb)
+  --parquet-dir <PATH>   Directory for intermediate Parquet files (default: parquet-dir)
+  --resume               Skip dump re-scan when Parquet files already exist
+  --force                Re-populate even if names are already resolved
+  --config <PATH>        TOML config file (default: wiki_db.toml)
+```
+
+Requires a `bootstrap`ed database at schema v2 (16 tables).  Re-scans the dump
+(~tens of minutes) to extract labels and enrichment claims, then backfills
+`album.name`, `track.name`, `release_date`, `record_label`, and
+`duration_seconds`.  Skips with a message when all names are already resolved.
 
 ### `update` — Incrementally update the database
 
@@ -299,8 +370,10 @@ Log level precedence: `RUST_LOG` env var > `--verbose`/`--quiet` > config file >
 ```
 artist               — Core entity: person (musician) or group (band)
 genre                — Genre taxonomy (id, name)
+instrument           — Instrument lookup table (id, name)
+record_label         — Record label lookup table (id, name)
 artist_genre         — Many-to-many artist ↔ genre
-artist_instrument    — Many-to-many artist ↔ instrument (Q-ID)
+artist_instrument    — Many-to-many artist ↔ instrument
 artist_member_of     — Person → group membership
 album                — Albums, EPs, singles, compilations
 album_artist         — Many-to-many album ↔ artist (with role)
@@ -308,6 +381,8 @@ album_genre          — Many-to-many album ↔ genre
 track                — Individual tracks/songs
 track_album          — Many-to-many track ↔ album
 track_artist         — Many-to-many track ↔ artist (with role)
+qid_label            — English label/description lookup by Q-ID
+sync_state           — Last-sync timestamp for incremental updates
 schema_version       — Migration version tracking
 ```
 
@@ -370,7 +445,7 @@ scripts/           — Helper scripts (dump downloader)
 | `parquet` + `arrow` | Intermediate columnar format |
 | `flate2` | Gzip decompression |
 | `tracing` + `indicatif` | Logging and progress bars |
-| `tokio` + `reqwest` | Async runtime (Phase 7, not yet used) |
+| `tokio` + `reqwest` | Async HTTP for the update pipeline (`src/sparql.rs` wraps the `reqwest` client in a Tokio runtime) |
 | `anyhow` + `thiserror` | Error handling |
 | `chrono` | Date/time parsing |
 | `regex` | Text matching |
@@ -384,7 +459,7 @@ scripts/           — Helper scripts (dump downloader)
 ## Limitations
 
 - **English-only**: Artists without English labels get NULL names (stored, not rejected)
-- **Album/track names**: Use Wikidata Q-ID placeholders — actual name resolution is deferred
+- **Album/track names**: Stored as Q-ID placeholders until `populate` is run; `release_date`, `record_label`, and `duration_seconds` are NULL until then
 - **Resume v1**: `--resume` restarts streaming from the beginning; only Parquet files are skipped
 
 ## License
