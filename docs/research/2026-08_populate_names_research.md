@@ -16,7 +16,7 @@
 
 ## 1. Problem Statement
 
-The wiki_db pipeline produces a normalized DuckDB database with 12 tables. Most columns that should contain human-readable names are populated correctly, but several are not:
+The wiki_db pipeline produces a normalized DuckDB database with 12 tables (schema v1 at the time of this research; the schema is now v2 with 16 tables). Most columns that should contain human-readable names are populated correctly, but several are not:
 
 | Column | Rows | With real names | Status |
 |--------|------|-----------------|--------|
