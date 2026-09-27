@@ -447,6 +447,183 @@ fn test_update_genre_placeholder() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: Work entities (album/track) land in their own tables, not artist
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_update_work_entities_land_in_album_track() {
+    let conn = test_conn();
+
+    // Performer: U2 (Q396), a music group.
+    let artist_json = r#"{
+        "entities": {
+            "Q396": {
+                "id": "Q396",
+                "type": "item",
+                "labels": { "en": { "value": "U2" } },
+                "claims": {
+                    "P31": [
+                        {
+                            "mainsnak": {
+                                "snaktype": "value",
+                                "datavalue": {
+                                    "value": { "id": "Q215380" }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    }"#;
+    let artist = parse_entity_response(artist_json, "Q396");
+    assert!(is_music_entity(&artist.claims).is_included());
+    upsert_entity_from_json(&conn, &artist).unwrap();
+
+    // Album work: The Joshua Tree — P31 album + P175 performer (U2).
+    let album_json = r#"{
+        "entities": {
+            "Q152873": {
+                "id": "Q152873",
+                "type": "item",
+                "labels": { "en": { "value": "The Joshua Tree" } },
+                "claims": {
+                    "P31": [
+                        {
+                            "mainsnak": {
+                                "snaktype": "value",
+                                "datavalue": {
+                                    "value": { "id": "Q482994" }
+                                }
+                            }
+                        }
+                    ],
+                    "P175": [
+                        {
+                            "mainsnak": {
+                                "snaktype": "value",
+                                "datavalue": {
+                                    "value": { "id": "Q396" }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    }"#;
+    let album = parse_entity_response(album_json, "Q152873");
+    upsert_entity_from_json(&conn, &album).unwrap();
+
+    // Track work: a song — P31 song + P175 performer (U2) + P361 parent album.
+    let track_json = r#"{
+        "entities": {
+            "Q155849": {
+                "id": "Q155849",
+                "type": "item",
+                "labels": { "en": { "value": "With or Without You" } },
+                "claims": {
+                    "P31": [
+                        {
+                            "mainsnak": {
+                                "snaktype": "value",
+                                "datavalue": {
+                                    "value": { "id": "Q7366" }
+                                }
+                            }
+                        }
+                    ],
+                    "P175": [
+                        {
+                            "mainsnak": {
+                                "snaktype": "value",
+                                "datavalue": {
+                                    "value": { "id": "Q396" }
+                                }
+                            }
+                        }
+                    ],
+                    "P361": [
+                        {
+                            "mainsnak": {
+                                "snaktype": "value",
+                                "datavalue": {
+                                    "value": { "id": "Q152873" }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    }"#;
+    let track = parse_entity_response(track_json, "Q155849");
+    upsert_entity_from_json(&conn, &track).unwrap();
+
+    // Only the performer lands in artist; both works must stay out of it.
+    let artist_count: usize = conn
+        .query_row("SELECT COUNT(*) FROM artist", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(artist_count, 1, "Only the performer should be in artist");
+    let work_in_artist: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM artist WHERE id IN ('Q152873', 'Q155849')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        work_in_artist, 0,
+        "Work entities must never land in the artist table"
+    );
+
+    // Album work lands in album with its own label.
+    let album_name: String = conn
+        .query_row("SELECT name FROM album WHERE id = 'Q152873'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(album_name, "The Joshua Tree");
+
+    // Track work lands in track with its own label.
+    let track_name: String = conn
+        .query_row("SELECT name FROM track WHERE id = 'Q155849'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(track_name, "With or Without You");
+
+    // Performer junctions reference the agent, not the works.
+    let aa_count: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM album_artist WHERE album_id = 'Q152873' AND artist_id = 'Q396'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(aa_count, 1, "Expected 1 album_artist row");
+
+    let ta_count: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM track_artist WHERE track_id = 'Q155849' AND artist_id = 'Q396'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(ta_count, 1, "Expected 1 track_artist row");
+
+    // Parent junction: track → album via P361.
+    let talbum_count: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM track_album WHERE track_id = 'Q155849' AND album_id = 'Q152873'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(talbum_count, 1, "Expected 1 track_album row");
+}
+
+// ---------------------------------------------------------------------------
 // Test: Combined flow — parse SPARQL → parse entity → upsert → sync state
 // ---------------------------------------------------------------------------
 

@@ -16,6 +16,15 @@
 //!
 //! All insert statements use `INSERT OR IGNORE`, so calling `load_all` multiple
 //! times with the same Parquet files produces identical database state.
+//!
+//! ## Update-path role routing
+//!
+//! [`upsert_entity_inner`] routes incremental-update entities by their
+//! [`EntityRole`]: agents → `artist` (plus artist-side joins), album works →
+//! `album` (plus `album_artist`), track works → `track` (plus
+//! `track_artist`/`track_album`). Performer/parent junctions are FK-guarded
+//! exactly like the bootstrap loaders, so a single-entity update never aborts
+//! on references that have not (yet) loaded.
 
 use std::path::Path;
 
@@ -23,7 +32,7 @@ use anyhow::{Context, Result};
 use duckdb::Connection;
 
 use crate::extraction::{MusicEntity, extract_music_entity};
-use crate::wikidata::filter::{classify_entity, is_music_entity};
+use crate::wikidata::filter::{EntityRole, classify_entity};
 use crate::wikidata::model::Entity;
 use crate::wikidata::stream::FilteredEntity;
 
@@ -786,9 +795,10 @@ pub fn load_albums_and_tracks(conn: &Connection, parquet_dir: &Path) -> Result<(
 
 /// Upsert a single `MusicEntity` into the DuckDB database.
 ///
-/// Wraps the operation in a DuckDB transaction for atomicity. Uses
-/// `INSERT OR REPLACE` for core entities (artist, album, track) and
-/// `INSERT OR IGNORE` for join tables to handle idempotency.
+/// Wraps the operation in a DuckDB transaction for atomicity, then routes
+/// the entity by its [`EntityRole`] (see [`upsert_entity_inner`]): agents are
+/// written to `artist`, album works to `album`, track works to `track`.
+/// Core rows use `INSERT OR REPLACE`; join tables use `INSERT OR IGNORE`.
 ///
 /// Genre Q-IDs that don't exist in the `genre` table are inserted as
 /// placeholders with the Q-ID as the name (the full dump bootstrap will
@@ -830,7 +840,45 @@ pub fn upsert_entity(conn: &Connection, music_entity: &MusicEntity) -> Result<()
 }
 
 /// Inner upsert logic (runs inside a transaction).
+///
+/// Routes the entity by its [`EntityRole`]:
+///
+/// - `Agent` — the `artist` row plus its artist-side join tables (genres,
+///   instruments, group membership).
+/// - `Album` — the `album` row (the work itself, never `artist`) plus
+///   `album_artist` junctions from its P175 [`crate::extraction::PerformerRef`]s.
+/// - `Track` — the `track` row plus `track_artist` junctions from P175 refs
+///   and `track_album` junctions from its P361 parent albums.
+///
+/// Performer/parent junction inserts are FK-guarded (rows referencing an
+/// artist/album absent from the database are skipped, mirroring the bootstrap
+/// loaders), so upserting a single work entity never aborts the transaction
+/// over references that have not (yet) loaded.
 fn upsert_entity_inner(conn: &Connection, entity: &MusicEntity) -> Result<()> {
+    // 1. Record the entity's English label in qid_label (if any) so `populate`
+    //    name resolution and work-name lookups can find it later.
+    if let Some(ref name) = entity.name {
+        let description = entity.description.as_deref();
+        conn.execute(
+            "INSERT OR IGNORE INTO qid_label (qid, label, description) \
+             VALUES (?1, ?2, ?3)",
+            duckdb::params![entity.id, name, description],
+        )
+        .with_context(|| format!("Failed to upsert qid_label for {}", entity.id))?;
+    }
+
+    match entity.role {
+        EntityRole::Agent => upsert_agent(conn, entity),
+        EntityRole::Album => upsert_album_work(conn, entity),
+        EntityRole::Track => upsert_track_work(conn, entity),
+    }
+}
+
+/// Upsert an agent: the `artist` row plus its artist-side join tables.
+///
+/// Genres that don't exist in the `genre` table are inserted as Q-ID
+/// placeholders so the `artist_genre` foreign key is always satisfiable.
+fn upsert_agent(conn: &Connection, entity: &MusicEntity) -> Result<()> {
     // 1. Upsert the artist
     conn.execute(
         "INSERT OR REPLACE INTO artist \
@@ -847,20 +895,6 @@ fn upsert_entity_inner(conn: &Connection, entity: &MusicEntity) -> Result<()> {
         ],
     )
     .with_context(|| format!("Failed to upsert artist {}", entity.id))?;
-
-    // 1b. Upsert into qid_label if the entity has an English label
-    //     This ensures the qid_label table is populated for newly-fetched
-    //     entities during incremental updates, so album/track stub names
-    //     can be resolved via COALESCE lookups below.
-    if let Some(ref name) = entity.name {
-        let description = entity.description.as_deref();
-        conn.execute(
-            "INSERT OR IGNORE INTO qid_label (qid, label, description) \
-             VALUES (?1, ?2, ?3)",
-            duckdb::params![entity.id, name, description],
-        )
-        .with_context(|| format!("Failed to upsert qid_label for {}", entity.id))?;
-    }
 
     // 2. Upsert genres with placeholder names if needed
     for genre_qid in &entity.genres {
@@ -913,44 +947,99 @@ fn upsert_entity_inner(conn: &Connection, entity: &MusicEntity) -> Result<()> {
         })?;
     }
 
-    // 6. Upsert albums and album_artist
-    for album_ref in &entity.albums {
-        conn.execute(
-            "INSERT OR REPLACE INTO album (id, name) \
-             VALUES (?1, COALESCE((SELECT label FROM qid_label WHERE qid = ?1), ?1))",
-            duckdb::params![album_ref.qid],
-        )
-        .with_context(|| format!("Failed to upsert album {} for {}", album_ref.qid, entity.id))?;
+    Ok(())
+}
 
+/// Resolve the display name for an album/track work row.
+///
+/// Precedence: the work's own English label → the `qid_label` table (from
+/// `populate` or earlier upserts) → the Q-ID as a placeholder, because the
+/// schema requires a non-NULL name.
+fn resolve_work_name(conn: &Connection, entity: &MusicEntity) -> Result<String> {
+    if let Some(name) = &entity.name {
+        return Ok(name.clone());
+    }
+    let from_qid_label: Option<String> = conn
+        .query_row(
+            "SELECT label FROM qid_label WHERE qid = ?1",
+            duckdb::params![entity.id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    Ok(from_qid_label.unwrap_or_else(|| entity.id.clone()))
+}
+
+/// Upsert an album work: the `album` row plus its `album_artist` junctions.
+///
+/// The work's own Q-ID becomes the album ID and its P175
+/// [`crate::extraction::PerformerRef`]s — which point *to* the featured
+/// performers, never to other works — populate `album_artist`. The album is
+/// `INSERT OR REPLACE`d so repeated updates refresh its name, and is never
+/// written to `artist` (the historical role inversion).
+fn upsert_album_work(conn: &Connection, entity: &MusicEntity) -> Result<()> {
+    let name = resolve_work_name(conn, entity)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO album (id, name) VALUES (?1, ?2)",
+        duckdb::params![entity.id, name],
+    )
+    .with_context(|| format!("Failed to upsert album {}", entity.id))?;
+
+    for performer in &entity.albums {
         conn.execute(
-            "INSERT OR IGNORE INTO album_artist (album_id, artist_id, role) VALUES (?1, ?2, ?3)",
-            duckdb::params![album_ref.qid, entity.id, album_ref.role],
+            "INSERT OR IGNORE INTO album_artist (album_id, artist_id, role) \
+             SELECT ?1, ?2, ?3 WHERE ?2 IN (SELECT id FROM artist)",
+            duckdb::params![entity.id, performer.qid, performer.role],
         )
         .with_context(|| {
             format!(
-                "Failed to upsert album_artist {} for {}",
-                album_ref.qid, entity.id
+                "Failed to upsert album_artist for album {} performer {}",
+                entity.id, performer.qid
             )
         })?;
     }
 
-    // 7. Upsert tracks and track_artist
-    for track_ref in &entity.tracks {
-        conn.execute(
-            "INSERT OR REPLACE INTO track (id, name) \
-             VALUES (?1, COALESCE((SELECT label FROM qid_label WHERE qid = ?1), ?1))",
-            duckdb::params![track_ref.qid],
-        )
-        .with_context(|| format!("Failed to upsert track {} for {}", track_ref.qid, entity.id))?;
+    Ok(())
+}
 
+/// Upsert a track work: the `track` row plus its `track_artist` and
+/// `track_album` junctions.
+///
+/// P175 [`crate::extraction::PerformerRef`]s feed `track_artist`; P361 parent
+/// album Q-IDs feed `track_album` (one junction row per parent). Both junction
+/// inserts are FK-guarded against `artist`/`album` respectively.
+fn upsert_track_work(conn: &Connection, entity: &MusicEntity) -> Result<()> {
+    let name = resolve_work_name(conn, entity)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO track (id, name) VALUES (?1, ?2)",
+        duckdb::params![entity.id, name],
+    )
+    .with_context(|| format!("Failed to upsert track {}", entity.id))?;
+
+    for performer in &entity.albums {
         conn.execute(
-            "INSERT OR IGNORE INTO track_artist (track_id, artist_id, role) VALUES (?1, ?2, ?3)",
-            duckdb::params![track_ref.qid, entity.id, track_ref.role],
+            "INSERT OR IGNORE INTO track_artist (track_id, artist_id, role) \
+             SELECT ?1, ?2, ?3 WHERE ?2 IN (SELECT id FROM artist)",
+            duckdb::params![entity.id, performer.qid, performer.role],
         )
         .with_context(|| {
             format!(
-                "Failed to upsert track_artist {} for {}",
-                track_ref.qid, entity.id
+                "Failed to upsert track_artist for track {} performer {}",
+                entity.id, performer.qid
+            )
+        })?;
+    }
+
+    for parent_album in &entity.parent_album {
+        conn.execute(
+            "INSERT OR IGNORE INTO track_album (track_id, album_id) \
+             SELECT ?1, ?2 WHERE ?2 IN (SELECT id FROM album)",
+            duckdb::params![entity.id, parent_album],
+        )
+        .with_context(|| {
+            format!(
+                "Failed to upsert track_album for track {} parent {}",
+                entity.id, parent_album
             )
         })?;
     }
@@ -960,12 +1049,13 @@ fn upsert_entity_inner(conn: &Connection, entity: &MusicEntity) -> Result<()> {
 
 /// Upsert a deserialized `Entity` (from the REST API fetcher) into the database.
 ///
-/// Checks whether the entity still matches music criteria via
-/// `is_music_entity()`. If it does, extracts the `MusicEntity` and
-/// calls `upsert_entity()`. If it no longer matches, logs a warning
-/// and skips it (deletion of stale rows is a documented limitation).
+/// Classifies the entity via [`classify_entity`]. If it no longer matches
+/// music criteria, logs a warning and skips it (deletion of stale rows is a
+/// documented limitation). Otherwise it extracts the `MusicEntity` — which
+/// carries the classified role — and calls [`upsert_entity`], which routes
+/// the upsert into the artist/album/track tables according to that role.
 ///
-/// # Errors
+/// # Returns
 ///
 /// Returns `Ok(true)` if the entity was upserted, `Ok(false)` if it was skipped
 /// (no longer matches music criteria).
@@ -974,23 +1064,14 @@ fn upsert_entity_inner(conn: &Connection, entity: &MusicEntity) -> Result<()> {
 ///
 /// Returns an error if extraction fails for a valid music entity.
 pub fn upsert_entity_from_json(conn: &Connection, entity: &Entity) -> Result<bool> {
-    let filter_result = is_music_entity(&entity.claims);
-
-    if !filter_result.is_included() {
+    // Classify once: an Included verdict carries both the role and the reason.
+    let Some((role, inclusion_reason)) = classify_entity(&entity.claims) else {
         tracing::warn!(
             entity_id = %entity.id,
             "Entity no longer matches music criteria, skipping"
         );
         return Ok(false);
-    }
-
-    let inclusion_reason = filter_result.reason().unwrap_or("unknown").to_string();
-
-    // `is_music_entity` is a thin wrapper over `classify_entity`, so an
-    // Included verdict is guaranteed to carry a classified role as well.
-    let role = classify_entity(&entity.claims)
-        .expect("included filter result always yields a classified role")
-        .0;
+    };
 
     let filtered = FilteredEntity {
         entity: entity.clone(),
@@ -2443,34 +2524,39 @@ mod tests {
     fn test_upsert_album_with_label_from_qid_label() {
         let conn = test_conn();
 
-        // Pre-populate qid_label with an album label
+        // The album work has no English label; qid_label supplies the name.
         conn.execute(
             "INSERT INTO qid_label (qid, label) VALUES ('Q55555', 'Greatest Hits')",
             [],
         )
         .unwrap();
 
-        let entity = MusicEntity {
-            id: "Q99995".to_string(),
-            name: Some("Test Artist".to_string()),
+        // The featured performer must exist as an artist for the junction FK.
+        let artist = make_test_entity("Q99995", Some("Test Artist"), vec![]);
+        upsert_entity(&conn, &artist).unwrap();
+
+        // Album work: its own Q-ID is the album; P175 refs are performers.
+        let album_work = MusicEntity {
+            id: "Q55555".to_string(),
+            name: None,
             description: None,
-            artist_type: "person".to_string(),
-            inclusion_reason: "P106:Q639669".to_string(),
-            role: crate::wikidata::filter::EntityRole::Agent,
+            artist_type: "group".to_string(),
+            inclusion_reason: "P31:Q482994".to_string(),
+            role: crate::wikidata::filter::EntityRole::Album,
             birth_date: None,
             death_date: None,
             genres: vec![],
             instruments: vec![],
             member_of: vec![],
             albums: vec![crate::extraction::PerformerRef {
-                qid: "Q55555".to_string(),
+                qid: "Q99995".to_string(),
                 role: Some("performer".to_string()),
             }],
             parent_album: vec![],
             tracks: vec![],
         };
 
-        upsert_entity(&conn, &entity).unwrap();
+        upsert_entity(&conn, &album_work).unwrap();
 
         // Verify album name is resolved from qid_label
         let album_name: String = conn
@@ -2482,40 +2568,73 @@ mod tests {
             album_name, "Greatest Hits",
             "Album name should be resolved from qid_label"
         );
+
+        // The work lands in album, never in artist.
+        let artist_count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artist WHERE id = 'Q55555'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            artist_count, 0,
+            "Album work must not land in the artist table"
+        );
+
+        // album_artist connects the album (work) to its performer (artist).
+        let aa_count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM album_artist WHERE album_id = 'Q55555' AND artist_id = 'Q99995'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(aa_count, 1, "Expected 1 album_artist row");
     }
 
     #[test]
     fn test_upsert_track_with_label_from_qid_label() {
         let conn = test_conn();
 
-        // Pre-populate qid_label with a track label
+        // The track work has no English label; qid_label supplies the name.
         conn.execute(
             "INSERT INTO qid_label (qid, label) VALUES ('Q66666', 'My Song')",
             [],
         )
         .unwrap();
 
-        let entity = MusicEntity {
-            id: "Q99995".to_string(),
-            name: Some("Test Artist".to_string()),
+        // Performer (artist) and parent album must exist for the junction FKs.
+        let artist = make_test_entity("Q99995", Some("Test Artist"), vec![]);
+        upsert_entity(&conn, &artist).unwrap();
+        conn.execute(
+            "INSERT INTO album (id, name) VALUES ('Q55555', 'Greatest Hits')",
+            [],
+        )
+        .unwrap();
+
+        // Track work: its own Q-ID is the track; P175 refs are performers.
+        let track_work = MusicEntity {
+            id: "Q66666".to_string(),
+            name: None,
             description: None,
-            artist_type: "person".to_string(),
-            inclusion_reason: "P106:Q639669".to_string(),
-            role: crate::wikidata::filter::EntityRole::Agent,
+            artist_type: "group".to_string(),
+            inclusion_reason: "P31:Q7366".to_string(),
+            role: crate::wikidata::filter::EntityRole::Track,
             birth_date: None,
             death_date: None,
             genres: vec![],
             instruments: vec![],
             member_of: vec![],
-            albums: vec![],
-            parent_album: vec![],
-            tracks: vec![crate::extraction::PerformerRef {
-                qid: "Q66666".to_string(),
+            albums: vec![crate::extraction::PerformerRef {
+                qid: "Q99995".to_string(),
                 role: Some("performer".to_string()),
             }],
+            parent_album: vec!["Q55555".to_string()],
+            tracks: vec![],
         };
 
-        upsert_entity(&conn, &entity).unwrap();
+        upsert_entity(&conn, &track_work).unwrap();
 
         // Verify track name is resolved from qid_label
         let track_name: String = conn
@@ -2527,70 +2646,21 @@ mod tests {
             track_name, "My Song",
             "Track name should be resolved from qid_label"
         );
-    }
 
-    #[test]
-    fn test_upsert_entity_with_albums_and_tracks() {
-        let conn = test_conn();
-
-        let entity = MusicEntity {
-            id: "Q99995".to_string(),
-            name: Some("Album Track Artist".to_string()),
-            description: None,
-            artist_type: "person".to_string(),
-            inclusion_reason: "P106:Q639669".to_string(),
-            role: crate::wikidata::filter::EntityRole::Agent,
-            birth_date: None,
-            death_date: None,
-            genres: vec![],
-            instruments: vec![],
-            member_of: vec![],
-            albums: vec![crate::extraction::PerformerRef {
-                qid: "Q55555".to_string(),
-                role: Some("performer".to_string()),
-            }],
-            parent_album: vec![],
-            tracks: vec![crate::extraction::PerformerRef {
-                qid: "Q66666".to_string(),
-                role: Some("performer".to_string()),
-            }],
-        };
-
-        upsert_entity(&conn, &entity).unwrap();
-
-        // Verify album
-        let album_name: String = conn
-            .query_row("SELECT name FROM album WHERE id = 'Q55555'", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(
-            album_name, "Q55555",
-            "Album should have Q-ID placeholder name"
-        );
-
-        // Verify album_artist
-        let aa_count: usize = conn
+        // The work lands in track, never in artist.
+        let artist_count: usize = conn
             .query_row(
-                "SELECT COUNT(*) FROM album_artist WHERE album_id = 'Q55555' AND artist_id = 'Q99995'",
+                "SELECT COUNT(*) FROM artist WHERE id = 'Q66666'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(aa_count, 1, "Expected 1 album_artist row");
-
-        // Verify track
-        let track_name: String = conn
-            .query_row("SELECT name FROM track WHERE id = 'Q66666'", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
         assert_eq!(
-            track_name, "Q66666",
-            "Track should have Q-ID placeholder name"
+            artist_count, 0,
+            "Track work must not land in the artist table"
         );
 
-        // Verify track_artist
+        // track_artist connects the track (work) to its performer (artist).
         let ta_count: usize = conn
             .query_row(
                 "SELECT COUNT(*) FROM track_artist WHERE track_id = 'Q66666' AND artist_id = 'Q99995'",
@@ -2599,6 +2669,215 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ta_count, 1, "Expected 1 track_artist row");
+
+        // track_album connects the track to its P361 parent album.
+        let talbum_count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM track_album WHERE track_id = 'Q66666' AND album_id = 'Q55555'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(talbum_count, 1, "Expected 1 track_album row");
+    }
+
+    #[test]
+    fn test_upsert_entity_with_albums_and_tracks() {
+        let conn = test_conn();
+
+        // Performer (artist) and parent-album foundations.
+        let artist = make_test_entity("Q99995", Some("Album Track Artist"), vec![]);
+        upsert_entity(&conn, &artist).unwrap();
+        conn.execute(
+            "INSERT INTO album (id, name) VALUES ('Q55555', 'Greatest Hits')",
+            [],
+        )
+        .unwrap();
+
+        // Album work: its P175 performer refs feed album_artist, and the work
+        // itself becomes the album row.
+        let album_work = MusicEntity {
+            id: "Q88888".to_string(),
+            name: Some("Test Album".to_string()),
+            description: None,
+            artist_type: "group".to_string(),
+            inclusion_reason: "P31:Q482994".to_string(),
+            role: crate::wikidata::filter::EntityRole::Album,
+            birth_date: None,
+            death_date: None,
+            genres: vec![],
+            instruments: vec![],
+            member_of: vec![],
+            albums: vec![crate::extraction::PerformerRef {
+                qid: "Q99995".to_string(),
+                role: Some("performer".to_string()),
+            }],
+            parent_album: vec![],
+            tracks: vec![],
+        };
+        upsert_entity(&conn, &album_work).unwrap();
+
+        // Track work: its P175 performer refs feed track_artist and its P361
+        // parent album feeds track_album; the work itself becomes the track row.
+        let track_work = MusicEntity {
+            id: "Q88889".to_string(),
+            name: Some("Test Track".to_string()),
+            description: None,
+            artist_type: "group".to_string(),
+            inclusion_reason: "P31:Q7366".to_string(),
+            role: crate::wikidata::filter::EntityRole::Track,
+            birth_date: None,
+            death_date: None,
+            genres: vec![],
+            instruments: vec![],
+            member_of: vec![],
+            albums: vec![crate::extraction::PerformerRef {
+                qid: "Q99995".to_string(),
+                role: Some("performer".to_string()),
+            }],
+            parent_album: vec!["Q55555".to_string()],
+            tracks: vec![],
+        };
+        upsert_entity(&conn, &track_work).unwrap();
+
+        // Verify the album row comes from the album work, with its own label.
+        let album_name: String = conn
+            .query_row("SELECT name FROM album WHERE id = 'Q88888'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(album_name, "Test Album");
+
+        // Verify the track row comes from the track work.
+        let track_name: String = conn
+            .query_row("SELECT name FROM track WHERE id = 'Q88889'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(track_name, "Test Track");
+
+        // Performer junctions: album_artist + track_artist reference the artist.
+        let aa_count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM album_artist WHERE album_id = 'Q88888' AND artist_id = 'Q99995'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(aa_count, 1, "Expected 1 album_artist row");
+
+        let ta_count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM track_artist WHERE track_id = 'Q88889' AND artist_id = 'Q99995'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ta_count, 1, "Expected 1 track_artist row");
+
+        // Parent junction: track_album references the parent album.
+        let talbum_count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM track_album WHERE track_id = 'Q88889' AND album_id = 'Q55555'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(talbum_count, 1, "Expected 1 track_album row");
+
+        // Works never land in artist — only the performer does.
+        let artist_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            artist_count, 1,
+            "Only the performer should be in artist, never the works"
+        );
+    }
+
+    #[test]
+    fn test_upsert_album_with_missing_performer_drops_junction() {
+        let conn = test_conn();
+
+        // Album work whose performer is NOT in the artist table: the album row
+        // must still upsert, and the junction must be dropped (FK guard) rather
+        // than aborting the transaction.
+        let album_work = MusicEntity {
+            id: "Q88888".to_string(),
+            name: Some("Test Album".to_string()),
+            description: None,
+            artist_type: "group".to_string(),
+            inclusion_reason: "P31:Q482994".to_string(),
+            role: crate::wikidata::filter::EntityRole::Album,
+            birth_date: None,
+            death_date: None,
+            genres: vec![],
+            instruments: vec![],
+            member_of: vec![],
+            albums: vec![crate::extraction::PerformerRef {
+                qid: "QMISSING".to_string(),
+                role: Some("performer".to_string()),
+            }],
+            parent_album: vec![],
+            tracks: vec![],
+        };
+
+        upsert_entity(&conn, &album_work).unwrap();
+
+        let album_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM album", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(album_count, 1, "Album row should still be upserted");
+
+        let aa_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM album_artist", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(aa_count, 0, "Missing-performer junction should be dropped");
+    }
+
+    #[test]
+    fn test_upsert_track_with_missing_parent_drops_junction() {
+        let conn = test_conn();
+
+        // Performer exists; the P361 parent album does not.
+        let artist = make_test_entity("Q99995", Some("Test Artist"), vec![]);
+        upsert_entity(&conn, &artist).unwrap();
+
+        let track_work = MusicEntity {
+            id: "Q88889".to_string(),
+            name: Some("Test Track".to_string()),
+            description: None,
+            artist_type: "group".to_string(),
+            inclusion_reason: "P31:Q7366".to_string(),
+            role: crate::wikidata::filter::EntityRole::Track,
+            birth_date: None,
+            death_date: None,
+            genres: vec![],
+            instruments: vec![],
+            member_of: vec![],
+            albums: vec![crate::extraction::PerformerRef {
+                qid: "Q99995".to_string(),
+                role: Some("performer".to_string()),
+            }],
+            parent_album: vec!["QMISSING".to_string()],
+            tracks: vec![],
+        };
+        upsert_entity(&conn, &track_work).unwrap();
+
+        let track_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM track", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(track_count, 1, "Track row should still be upserted");
+
+        let ta_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM track_artist", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ta_count, 1, "Existing-performer junction should be created");
+
+        let talbum_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM track_album", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(talbum_count, 0, "Missing-parent junction should be dropped");
     }
 
     // -----------------------------------------------------------------------
