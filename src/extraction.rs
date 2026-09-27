@@ -19,6 +19,7 @@
 
 use std::collections::HashSet;
 
+use aho_corasick::AhoCorasick;
 use chrono::NaiveDate;
 
 use crate::wikidata::filter::EntityRole;
@@ -342,6 +343,11 @@ pub fn extract_genre_labels(
 ) -> Result<Vec<GenreEntry>, crate::error::Error> {
     use std::io::BufRead;
 
+    // Nothing to match — skip opening the dump file entirely.
+    if genre_qids.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let file = std::fs::File::open(dump_path).map_err(|e| crate::error::Error::Io {
         source: e,
         path: dump_path.to_path_buf(),
@@ -352,6 +358,14 @@ pub fn extract_genre_labels(
     let mut genres: Vec<GenreEntry> = Vec::new();
     let mut line_buf = String::new();
     let mut line_number: u64 = 0;
+
+    // Build an Aho-Corasick automaton from all genre Q-IDs for a single-pass
+    // O(L) substring match per dump line, replacing the O(K x L) linear scan
+    // over every genre Q-ID (K = 13K+ on a full dump, which made the second
+    // pass impractical). Built once before the loop; never mutated during.
+    let genre_patterns: Vec<&str> = genre_qids.iter().map(|s| s.as_str()).collect();
+    let ac = AhoCorasick::new(&genre_patterns)
+        .map_err(|e| crate::error::Error::Other(format!("Failed to build genre automaton: {e}")))?;
 
     loop {
         line_buf.clear();
@@ -378,8 +392,8 @@ pub fn extract_genre_labels(
         let line = trimmed.trim_end_matches(',');
 
         // Quick check: does this line contain any of our genre Q-IDs?
-        // Performance optimization: skip deserialization if no genre Q-ID appears
-        if !genre_qids.iter().any(|qid| line.contains(qid.as_str())) {
+        // Performance optimization: skip deserialization if no genre Q-ID appears.
+        if ac.find(line).is_none() {
             continue;
         }
 
@@ -987,6 +1001,48 @@ mod tests {
 
         let entry = extract_genre_entity(&entity);
         assert!(entry.is_none());
+    }
+
+    #[test]
+    fn test_extract_genre_labels_uses_aho_corasick() {
+        // A tiny gzip dump: one genre entity, one music entity that *references*
+        // the genre Q-ID (precheck passes but is not the genre itself), and one
+        // unrelated entity the automaton precheck must skip.
+        use std::io::Write;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let path = dir.path().join("genres_fixture.json.gz");
+        let file = std::fs::File::create(&path).expect("create fixture file");
+        let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+
+        let content = br#"[
+{"id":"Q35718","type":"item","labels":{"en":{"value":"jazz"}},"claims":{}},
+{"id":"Q123","type":"item","labels":{"en":{"value":"Singer"}},"claims":{"P136":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q35718"}}}}]}},
+{"id":"Q999","type":"item","labels":{"en":{"value":"Unrelated"}},"claims":{"P31":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q5"}}}}]}}
+]"#;
+
+        encoder.write_all(content).expect("write fixture");
+        encoder.finish().expect("finish fixture");
+
+        let mut genre_qids = HashSet::new();
+        genre_qids.insert("Q35718".into());
+
+        let genres = extract_genre_labels(&path, &genre_qids).expect("extract genre labels");
+
+        assert_eq!(genres.len(), 1);
+        assert_eq!(genres[0].id, "Q35718");
+        assert_eq!(genres[0].name, "jazz");
+    }
+
+    #[test]
+    fn test_extract_genre_labels_empty_set_skips_dump() {
+        // No Q-IDs to match: returns empty without opening the dump.
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let path = dir.path().join("missing.json.gz");
+        let empty: HashSet<String> = HashSet::new();
+
+        let genres = extract_genre_labels(&path, &empty).expect("extract with empty genre set");
+        assert!(genres.is_empty());
     }
 
     fn create_dummy(id: &str) -> MusicEntity {
