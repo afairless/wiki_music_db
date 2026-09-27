@@ -174,6 +174,8 @@ mod tests {
             mainsnak: Some(Mainsnak {
                 snaktype: "value".into(),
                 datavalue: Some(DatavalueValue {
+                    amount: None,
+                    unit: None,
                     precision: None,
                     id: Some(id.into()),
                     time: None,

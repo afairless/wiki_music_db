@@ -36,6 +36,24 @@ pub struct Entity {
     /// Defaults to an empty map when absent.
     #[serde(default)]
     pub claims: HashMap<String, Vec<Claim>>,
+
+    /// Sitelinks keyed by site code (e.g. `"enwiki"`).
+    ///
+    /// Used as a label fallback for entities that lack an English label
+    /// (e.g. the `enwiki` article title). `None` when the entity has no
+    /// sitelinks at all.
+    #[serde(default)]
+    pub sitelinks: Option<HashMap<String, Sitelink>>,
+}
+
+/// A single sitelink (e.g. a Wikipedia article) on a Wikidata entity.
+///
+/// Only the article `title` is captured; other sitelink fields (`site`,
+/// `badges`, `url`, …) are silently ignored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Sitelink {
+    /// The article title on that site (e.g. `"The Joshua Tree"`).
+    pub title: String,
 }
 
 /// Language-keyed labels.
@@ -108,9 +126,9 @@ pub struct Mainsnak {
 
 /// The extracted value from a mainsnak's datavalue.
 ///
-/// Only `id` (for Q-ID references), `time` (for dates), and `precision`
-/// (for date precision) are captured. All other fields in the nested
-/// value object are silently ignored.
+/// Captures `id` (Q-ID references), `time`/`precision` (dates), and
+/// `amount`/`unit` (quantities, e.g. P2047 track duration claims). All
+/// other fields in the nested value object are silently ignored.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct DatavalueValue {
     #[serde(default)]
@@ -120,6 +138,13 @@ pub struct DatavalueValue {
     /// Wikidata precision code: 11=day, 10=month, 9=year, 8=decade, etc.
     #[serde(default)]
     pub precision: Option<i64>,
+    /// Quantity amount as a normalized string (e.g. `"+240"`).
+    #[serde(default)]
+    pub amount: Option<String>,
+    /// Quantity unit as a Wikidata entity URI (e.g.
+    /// `"http://www.wikidata.org/entity/Q11574"` for seconds).
+    #[serde(default)]
+    pub unit: Option<String>,
 }
 
 // --- Custom Serialize + Deserialize for Mainsnak ---
@@ -135,7 +160,7 @@ impl Serialize for Mainsnak {
         map.serialize_entry("snaktype", &self.snaktype)?;
 
         if let Some(ref dv) = self.datavalue {
-            // Build the datavalue object: { "value": { "id": ..., "time": ... } }
+            // Build the datavalue object: { "value": { ...captured fields... } }
             let inner = serde_json::json!(dv);
             let datavalue_obj = serde_json::json!({"value": inner});
             map.serialize_entry("datavalue", &datavalue_obj)?;
@@ -231,6 +256,8 @@ mod tests {
         assert_eq!(
             ms.datavalue,
             Some(DatavalueValue {
+                amount: None,
+                unit: None,
                 precision: None,
                 id: Some("Q639669".into()),
                 time: None
@@ -252,6 +279,8 @@ mod tests {
         assert_eq!(
             ms.datavalue,
             Some(DatavalueValue {
+                amount: None,
+                unit: None,
                 precision: None,
                 id: None,
                 time: Some("+1926-09-23T00:00:00Z".into())
@@ -306,6 +335,8 @@ mod tests {
         assert_eq!(
             claim.mainsnak.as_ref().unwrap().datavalue,
             Some(DatavalueValue {
+                amount: None,
+                unit: None,
                 precision: None,
                 id: Some("Q639669".into()),
                 time: None
@@ -346,6 +377,8 @@ mod tests {
         assert_eq!(
             p106[0].mainsnak.as_ref().unwrap().datavalue,
             Some(DatavalueValue {
+                amount: None,
+                unit: None,
                 precision: None,
                 id: Some("Q639669".into()),
                 time: None
@@ -360,6 +393,7 @@ mod tests {
     #[test]
     fn test_entity_round_trip() {
         let entity = Entity {
+            sitelinks: None,
             id: "Q2831".into(),
             entity_type: "item".into(),
             labels: Some(Labels({
@@ -390,6 +424,8 @@ mod tests {
                         mainsnak: Some(Mainsnak {
                             snaktype: "value".into(),
                             datavalue: Some(DatavalueValue {
+                                amount: None,
+                                unit: None,
                                 precision: None,
                                 id: Some("Q639669".into()),
                                 time: None,
@@ -558,6 +594,8 @@ mod tests {
         assert_eq!(
             p31[0].mainsnak.as_ref().unwrap().datavalue,
             Some(DatavalueValue {
+                amount: None,
+                unit: None,
                 precision: None,
                 id: Some("Q215380".into()),
                 time: None
@@ -650,10 +688,170 @@ mod tests {
         assert_eq!(
             p569[0].mainsnak.as_ref().unwrap().datavalue,
             Some(DatavalueValue {
+                amount: None,
+                unit: None,
                 precision: None,
                 id: None,
                 time: Some("not-a-date".into())
             })
+        );
+    }
+
+    // --- Quantity datavalue and sitelinks tests (entity-role-inversion fix) ---
+
+    /// Quantity datavalue from the dump shape: `amount`/`unit` are captured;
+    /// the existing id/time/precision paths are unaffected.
+    #[test]
+    fn test_quantity_datavalue_captures_amount_and_unit() {
+        let json = r#"{
+            "snaktype": "value",
+            "datavalue": {
+                "type": "quantity",
+                "value": {
+                    "amount": "+240",
+                    "unit": "http://www.wikidata.org/entity/Q11574",
+                    "upperBound": "+240",
+                    "lowerBound": "+240"
+                }
+            }
+        }"#;
+        let ms: Mainsnak = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(ms.snaktype, "value");
+        assert_eq!(
+            ms.datavalue,
+            Some(DatavalueValue {
+                amount: Some("+240".into()),
+                unit: Some("http://www.wikidata.org/entity/Q11574".into()),
+                precision: None,
+                id: None,
+                time: None,
+            })
+        );
+    }
+
+    /// Quantity datavalue without a unit: `amount` is captured, `unit` is `None`.
+    #[test]
+    fn test_quantity_datavalue_without_unit() {
+        let json = r#"{
+            "snaktype": "value",
+            "datavalue": {
+                "value": { "amount": "+180" }
+            }
+        }"#;
+        let ms: Mainsnak = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            ms.datavalue,
+            Some(DatavalueValue {
+                amount: Some("+180".into()),
+                unit: None,
+                precision: None,
+                id: None,
+                time: None,
+            })
+        );
+    }
+
+    /// Entity with sitelinks: the `enwiki` title is captured; extra sitelink
+    /// fields (`site`, `badges`, `url`) are ignored.
+    #[test]
+    fn test_entity_with_sitelinks() {
+        let json = r#"{
+            "id": "Q152873",
+            "type": "item",
+            "labels": { "en": { "value": "The Joshua Tree" } },
+            "sitelinks": {
+                "enwiki": {
+                    "site": "enwiki",
+                    "title": "The Joshua Tree",
+                    "badges": [],
+                    "url": "https://en.wikipedia.org/wiki/The_Joshua_Tree"
+                },
+                "dewiki": {
+                    "site": "dewiki",
+                    "title": "The Joshua Tree (Album)",
+                    "badges": [],
+                    "url": "https://de.wikipedia.org/wiki/The_Joshua_Tree_(Album)"
+                }
+            }
+        }"#;
+        let entity: Entity = serde_json::from_str(json).expect("deserialize");
+        let sitelinks = entity.sitelinks.as_ref().expect("sitelinks present");
+        assert_eq!(sitelinks.len(), 2);
+        assert_eq!(sitelinks["enwiki"].title, "The Joshua Tree");
+        assert_eq!(sitelinks["dewiki"].title, "The Joshua Tree (Album)");
+    }
+
+    /// Entity without sitelinks: the field defaults to `None`.
+    #[test]
+    fn test_entity_without_sitelinks_is_none() {
+        let json = r#"{
+            "id": "Q42",
+            "type": "item",
+            "claims": {}
+        }"#;
+        let entity: Entity = serde_json::from_str(json).expect("deserialize");
+        assert!(entity.sitelinks.is_none());
+    }
+
+    /// Round-trip: quantity `amount`/`unit` and `sitelinks` survive serialize
+    /// and deserialize.
+    #[test]
+    fn test_sitelinks_and_quantity_round_trip() {
+        let entity = Entity {
+            id: "Q152873".into(),
+            entity_type: "item".into(),
+            labels: None,
+            descriptions: None,
+            claims: {
+                let mut claims = HashMap::new();
+                claims.insert(
+                    "P2047".into(),
+                    vec![Claim {
+                        mainsnak: Some(Mainsnak {
+                            snaktype: "value".into(),
+                            datavalue: Some(DatavalueValue {
+                                amount: Some("+240".into()),
+                                unit: Some("http://www.wikidata.org/entity/Q11574".into()),
+                                precision: None,
+                                id: None,
+                                time: None,
+                            }),
+                        }),
+                        extra: HashMap::new(),
+                    }],
+                );
+                claims
+            },
+            sitelinks: Some({
+                let mut m = HashMap::new();
+                m.insert(
+                    "enwiki".into(),
+                    Sitelink {
+                        title: "The Joshua Tree".into(),
+                    },
+                );
+                m
+            }),
+        };
+
+        let json = serde_json::to_string(&entity).expect("serialize");
+        let deserialized: Entity = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(
+            deserialized.sitelinks.as_ref().unwrap()["enwiki"].title,
+            "The Joshua Tree"
+        );
+        let p2047 = &deserialized.claims["P2047"];
+        assert_eq!(
+            p2047[0]
+                .mainsnak
+                .as_ref()
+                .unwrap()
+                .datavalue
+                .as_ref()
+                .unwrap()
+                .amount,
+            Some("+240".into())
         );
     }
 }

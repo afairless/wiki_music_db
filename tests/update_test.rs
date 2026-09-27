@@ -323,6 +323,7 @@ fn test_update_entity_no_longer_music_skipped() {
     // Create an entity that has no music properties (was previously music,
     // but no longer matches criteria)
     let entity = Entity {
+        sitelinks: None,
         id: "Q99992".to_string(),
         entity_type: "item".to_string(),
         labels: None,
@@ -336,6 +337,8 @@ fn test_update_entity_no_longer_music_skipped() {
                     mainsnak: Some(wiki_db::wikidata::model::Mainsnak {
                         snaktype: "value".to_string(),
                         datavalue: Some(wiki_db::wikidata::model::DatavalueValue {
+                            amount: None,
+                            unit: None,
                             precision: None,
                             id: Some("Q5".to_string()),
                             time: None,

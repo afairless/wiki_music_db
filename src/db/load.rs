@@ -1869,6 +1869,7 @@ mod tests {
 
         // Create an entity that has no music properties
         let entity = Entity {
+            sitelinks: None,
             id: "Q99992".to_string(),
             entity_type: "item".to_string(),
             labels: None,
@@ -1979,6 +1980,7 @@ mod tests {
 
         // Create a valid Entity with a music occupation
         let entity = crate::wikidata::model::Entity {
+            sitelinks: None,
             id: "Q99994".to_string(),
             entity_type: "item".to_string(),
             labels: Some(crate::wikidata::model::Labels({
@@ -2000,6 +2002,8 @@ mod tests {
                         mainsnak: Some(crate::wikidata::model::Mainsnak {
                             snaktype: "value".to_string(),
                             datavalue: Some(crate::wikidata::model::DatavalueValue {
+                                amount: None,
+                                unit: None,
                                 precision: None,
                                 id: Some("Q639669".to_string()),
                                 time: None,

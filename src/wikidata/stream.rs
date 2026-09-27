@@ -28,7 +28,11 @@ pub struct FilteredEntity {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
     /// A filtered entity was found.
-    Filtered(FilteredEntity),
+    ///
+    /// Boxed to keep the enum small ([`FilteredEntity`] embeds the full
+    /// [`Entity`] model, which grew with `sitelinks`); left on the heap and
+    /// transparently deref'd at every use site.
+    Filtered(Box<FilteredEntity>),
     /// A line could not be parsed as a valid entity.
     Rejected {
         /// The 1-based line number in the dump file.
@@ -120,10 +124,10 @@ impl StreamReader {
                 match is_music_entity(&entity.claims) {
                     FilterResult::Included(reason) => {
                         self.filtered += 1;
-                        Ok(Some(StreamEvent::Filtered(FilteredEntity {
+                        Ok(Some(StreamEvent::Filtered(Box::new(FilteredEntity {
                             entity,
                             inclusion_reason: reason,
-                        })))
+                        }))))
                     }
                     FilterResult::Excluded => {
                         // Valid entity but not music-related — skip silently
@@ -389,6 +393,7 @@ mod tests {
     #[test]
     fn test_filtered_entity_round_trip() {
         let entity = Entity {
+            sitelinks: None,
             id: "Q2831".into(),
             entity_type: "item".into(),
             labels: None,
@@ -401,6 +406,8 @@ mod tests {
                         mainsnak: Some(crate::wikidata::model::Mainsnak {
                             snaktype: "value".into(),
                             datavalue: Some(DatavalueValue {
+                                amount: None,
+                                unit: None,
                                 precision: None,
                                 id: Some("Q639669".into()),
                                 time: None,

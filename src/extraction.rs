@@ -418,6 +418,8 @@ mod tests {
             mainsnak: Some(Mainsnak {
                 snaktype: "value".into(),
                 datavalue: Some(DatavalueValue {
+                    amount: None,
+                    unit: None,
                     precision: None,
                     id: Some(id.into()),
                     time: None,
@@ -432,6 +434,8 @@ mod tests {
             mainsnak: Some(Mainsnak {
                 snaktype: "value".into(),
                 datavalue: Some(DatavalueValue {
+                    amount: None,
+                    unit: None,
                     precision: None,
                     id: None,
                     time: Some(time.into()),
@@ -450,6 +454,7 @@ mod tests {
     ) -> FilteredEntity {
         FilteredEntity {
             entity: Entity {
+                sitelinks: None,
                 id: id.into(),
                 entity_type: "item".into(),
                 labels: labels.map(Labels),
@@ -799,6 +804,7 @@ mod tests {
     #[test]
     fn test_extract_genre_entity() {
         let entity = Entity {
+            sitelinks: None,
             id: "Q35718".into(),
             entity_type: "item".into(),
             labels: Some(Labels({
@@ -829,6 +835,7 @@ mod tests {
     #[test]
     fn test_extract_genre_entity_no_label() {
         let entity = Entity {
+            sitelinks: None,
             id: "Q35718".into(),
             entity_type: "item".into(),
             labels: None,
@@ -843,6 +850,7 @@ mod tests {
     #[test]
     fn test_extract_genre_entity_empty_id() {
         let entity = Entity {
+            sitelinks: None,
             id: "".into(),
             entity_type: "item".into(),
             labels: Some(Labels({

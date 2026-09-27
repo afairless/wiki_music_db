@@ -760,6 +760,7 @@ mod tests {
             })
         });
         Entity {
+            sitelinks: None,
             id: id.to_string(),
             entity_type: "item".to_string(),
             labels,
@@ -779,6 +780,7 @@ mod tests {
     #[test]
     fn test_extract_label_no_en() {
         let entity = Entity {
+            sitelinks: None,
             id: "Q42".to_string(),
             entity_type: "item".to_string(),
             labels: Some(Labels({
@@ -817,6 +819,8 @@ mod tests {
             mainsnak: Some(Mainsnak {
                 snaktype: "value".into(),
                 datavalue: Some(DatavalueValue {
+                    amount: None,
+                    unit: None,
                     id: None,
                     time: Some(time.into()),
                     precision: Some(precision),
@@ -864,6 +868,8 @@ mod tests {
             mainsnak: Some(Mainsnak {
                 snaktype: "value".into(),
                 datavalue: Some(DatavalueValue {
+                    amount: None,
+                    unit: None,
                     id: Some(id.into()),
                     time: None,
                     precision: None,
@@ -876,6 +882,7 @@ mod tests {
     #[test]
     fn test_extract_claim_p264() {
         let entity = Entity {
+            sitelinks: None,
             id: "Q123".to_string(),
             entity_type: "item".to_string(),
             labels: None,
@@ -902,6 +909,8 @@ mod tests {
             mainsnak: Some(Mainsnak {
                 snaktype: "value".into(),
                 datavalue: Some(DatavalueValue {
+                    amount: None,
+                    unit: None,
                     id: None,
                     time: None,
                     precision: None,
@@ -926,6 +935,8 @@ mod tests {
             mainsnak: Some(Mainsnak {
                 snaktype: "value".into(),
                 datavalue: Some(DatavalueValue {
+                    amount: None,
+                    unit: None,
                     id: None,
                     time: Some("not-a-number".to_string()),
                     precision: None,
@@ -944,6 +955,7 @@ mod tests {
     #[test]
     fn test_extract_album_genre() {
         let entity = Entity {
+            sitelinks: None,
             id: "Q123".to_string(),
             entity_type: "item".to_string(),
             labels: None,
@@ -965,6 +977,7 @@ mod tests {
     #[test]
     fn test_extract_track_album() {
         let entity = Entity {
+            sitelinks: None,
             id: "Q456".to_string(),
             entity_type: "item".to_string(),
             labels: None,
