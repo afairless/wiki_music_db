@@ -3,7 +3,10 @@
 //! Writes filtered Wikidata entities to Parquet files with automatic
 //! file rotation at a configurable batch size. Uses a flat VARCHAR schema
 //! for v1 simplicity: arrays are stored as pipe-delimited strings, and
-//! album/track references are stored as JSON arrays.
+//! performer references (`albums`) plus parent-album Q-IDs (`parents`)
+//! are stored as JSON arrays. Each row also carries a non-null `role`
+//! column (`Agent`/`Album`/`Track`) so the DuckDB loader can route rows
+//! to the correct tables.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -97,6 +100,8 @@ struct BatchAccumulators {
     member_of: StringBuilder,
     albums: StringBuilder,
     tracks: StringBuilder,
+    role: StringBuilder,
+    parents: StringBuilder,
 }
 
 impl MusicEntityBatchWriter {
@@ -209,6 +214,10 @@ impl MusicEntityBatchWriter {
         let tracks_json =
             serde_json::to_string(&entity.tracks).unwrap_or_else(|_| "[]".to_string());
         acc.tracks.append_value(&tracks_json);
+        acc.role.append_value(format!("{:?}", entity.role));
+        let parents_json =
+            serde_json::to_string(&entity.parent_album).unwrap_or_else(|_| "[]".to_string());
+        acc.parents.append_value(&parents_json);
         Ok(())
     }
 
@@ -242,6 +251,8 @@ fn build_schema() -> SchemaRef {
         Field::new("member_of", DataType::Utf8, false),
         Field::new("albums", DataType::Utf8, false),
         Field::new("tracks", DataType::Utf8, false),
+        Field::new("role", DataType::Utf8, false),
+        Field::new("parents", DataType::Utf8, false),
     ]))
 }
 
@@ -260,6 +271,8 @@ impl BatchAccumulators {
             member_of: StringBuilder::new(),
             albums: StringBuilder::new(),
             tracks: StringBuilder::new(),
+            role: StringBuilder::new(),
+            parents: StringBuilder::new(),
         }
     }
 
@@ -278,6 +291,8 @@ impl BatchAccumulators {
             Arc::new(self.member_of.finish()),
             Arc::new(self.albums.finish()),
             Arc::new(self.tracks.finish()),
+            Arc::new(self.role.finish()),
+            Arc::new(self.parents.finish()),
         ];
         let batch =
             RecordBatch::try_new(schema, columns).context("Failed to create RecordBatch")?;
@@ -354,6 +369,9 @@ mod tests {
             vec![Some("Ivy Queen".into())]
         );
         assert_eq!(col_to_strings(&batches[0], 7), vec![Some("Q35718".into())]);
+        // role column round-trips the entity role; parents defaults to "[]" for agents.
+        assert_eq!(col_to_strings(&batches[0], 12), vec![Some("Agent".into())]);
+        assert_eq!(col_to_strings(&batches[0], 13), vec![Some("[]".into())]);
     }
 
     #[test]
@@ -513,6 +531,61 @@ mod tests {
         }
     }
 
+    /// Album/track works carry a `role` column and a `parents` JSON array
+    /// (P361 parent-album Q-IDs), so the loader can route rows by role.
+    #[test]
+    fn test_round_trip_role_and_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = MusicEntityBatchWriter::new(dir.path())
+            .unwrap()
+            .with_batch_size(100);
+        let album = MusicEntity {
+            id: "Q152873".to_string(),
+            name: Some("The Joshua Tree".to_string()),
+            description: None,
+            artist_type: "person".to_string(),
+            inclusion_reason: "P31:Q482994".to_string(),
+            role: crate::wikidata::filter::EntityRole::Album,
+            birth_date: None,
+            death_date: None,
+            genres: vec![],
+            instruments: vec![],
+            member_of: vec![],
+            albums: vec![],
+            parent_album: vec![],
+            tracks: vec![],
+        };
+        let track = MusicEntity {
+            id: "Q1234".to_string(),
+            name: Some("With or Without You".to_string()),
+            description: None,
+            artist_type: "person".to_string(),
+            inclusion_reason: "P31:Q7366".to_string(),
+            role: crate::wikidata::filter::EntityRole::Track,
+            birth_date: None,
+            death_date: None,
+            genres: vec![],
+            instruments: vec![],
+            member_of: vec![],
+            albums: vec![],
+            parent_album: vec!["Q152873".into()],
+            tracks: vec![],
+        };
+        writer.write_batch(&[album, track]).unwrap();
+        writer.flush().unwrap();
+        let batches = read_parquet(&dir.path().join("part-00001.parquet")).unwrap();
+        assert_eq!(batches[0].num_rows(), 2);
+        assert_eq!(
+            col_to_strings(&batches[0], 12),
+            vec![Some("Album".into()), Some("Track".into())]
+        );
+        // Parents: empty JSON array for the album, the P361 parent for the track.
+        assert_eq!(
+            col_to_strings(&batches[0], 13),
+            vec![Some("[]".into()), Some("[\"Q152873\"]".into())]
+        );
+    }
+
     #[test]
     fn test_round_trip_with_album_refs() {
         use crate::extraction::PerformerRef;
@@ -521,19 +594,19 @@ mod tests {
             .unwrap()
             .with_batch_size(100);
         let entity = MusicEntity {
-            id: "Q1".to_string(),
-            name: Some("Test".to_string()),
+            id: "Q152873".to_string(),
+            name: Some("The Joshua Tree".to_string()),
             description: None,
             artist_type: "person".to_string(),
-            inclusion_reason: "P106:Q639669".to_string(),
-            role: crate::wikidata::filter::EntityRole::Agent,
+            inclusion_reason: "P31:Q482994".to_string(),
+            role: crate::wikidata::filter::EntityRole::Album,
             birth_date: None,
             death_date: None,
             genres: vec![],
             instruments: vec![],
             member_of: vec![],
             albums: vec![PerformerRef {
-                qid: "Q123".into(),
+                qid: "Q396".into(),
                 role: Some("performer".into()),
             }],
             parent_album: vec![],
@@ -542,8 +615,20 @@ mod tests {
         writer.write_batch(&[entity]).unwrap();
         writer.flush().unwrap();
         let batches = read_parquet(&dir.path().join("part-00001.parquet")).unwrap();
+        // The albums JSON column serializes PerformerRef with a `qid` key —
+        // never the old inverted `album_id`/`track_id` key names.
         let albums_str = col_to_strings(&batches[0], 10);
-        assert!(albums_str[0].as_ref().unwrap().contains("Q123"));
-        assert!(albums_str[0].as_ref().unwrap().contains("performer"));
+        assert!(albums_str[0].as_ref().unwrap().contains(r#""qid":"Q396""#));
+        assert!(
+            albums_str[0]
+                .as_ref()
+                .unwrap()
+                .contains(r#""role":"performer""#)
+        );
+        assert!(!albums_str[0].as_ref().unwrap().contains("album_id"));
+        assert!(!albums_str[0].as_ref().unwrap().contains("track_id"));
+        // role + parents columns round-trip on the same row.
+        assert_eq!(col_to_strings(&batches[0], 12), vec![Some("Album".into())]);
+        assert_eq!(col_to_strings(&batches[0], 13), vec![Some("[]".into())]);
     }
 }
