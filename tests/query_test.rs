@@ -543,3 +543,126 @@ fn test_query_album_null_release_date() {
         "NULL release_date should be None"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Corrected roles: works live in album/track, agents in artist
+// ---------------------------------------------------------------------------
+
+/// Helper: populate role-corrected data mirroring the corrected bootstrap
+/// semantics — the agent (U2) lives in `artist`; the album work (The Joshua
+/// Tree) and the track work (With or Without You) live in `album`/`track`
+/// with performer/parent junctions, exactly as the loader routes them.
+fn populate_role_corrected_data(conn: &Connection) {
+    // Agent: U2 (Q396) — the only entity that belongs in `artist`.
+    conn.execute_batch(
+        "INSERT INTO artist (id, name, description, artist_type) VALUES
+            ('Q396', 'U2', 'Irish rock band', 'group');",
+    )
+    .unwrap();
+
+    // Album work: The Joshua Tree — performer junction points at the agent.
+    conn.execute_batch(
+        "INSERT INTO album (id, name, release_date) VALUES
+            ('Q152873', 'The Joshua Tree', '1987-03-09');
+         INSERT INTO album_artist (album_id, artist_id, role) VALUES
+            ('Q152873', 'Q396', 'performer');",
+    )
+    .unwrap();
+
+    // Track work: With or Without You — performer + parent-album junctions.
+    conn.execute_batch(
+        "INSERT INTO track (id, name, duration_seconds) VALUES
+            ('Q155849', 'With or Without You', 275);
+         INSERT INTO track_artist (track_id, artist_id, role) VALUES
+            ('Q155849', 'Q396', 'performer');
+         INSERT INTO track_album (track_id, album_id, track_number) VALUES
+            ('Q155849', 'Q152873', 1);",
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_query_album_joshua_tree_resolvable() {
+    let conn = test_conn();
+    populate_role_corrected_data(&conn);
+
+    // The album work is a first-class row in `album`, searchable by name.
+    let albums = query::search_album(&conn, "Joshua Tree").unwrap();
+    assert_eq!(
+        albums.len(),
+        1,
+        "Should resolve The Joshua Tree via album search"
+    );
+    assert_eq!(albums[0].id, "Q152873");
+    assert_eq!(albums[0].name, "The Joshua Tree");
+    assert_eq!(albums[0].release_date, NaiveDate::from_ymd_opt(1987, 3, 9));
+
+    // Partial term also resolves it.
+    let partial = query::search_album(&conn, "Joshua").unwrap();
+    assert_eq!(partial.len(), 1);
+    assert_eq!(partial[0].id, "Q152873");
+}
+
+#[test]
+fn test_query_album_not_surfaced_as_artist() {
+    let conn = test_conn();
+    populate_role_corrected_data(&conn);
+
+    // Corrected roles: the work must NOT appear in artist search — artist
+    // holds agents only, and the old inversion would have put it there.
+    let artists = query::search_artist(&conn, "Joshua Tree").unwrap();
+    assert!(
+        artists.is_empty(),
+        "Album work must not surface as an artist"
+    );
+}
+
+#[test]
+fn test_query_artist_u2_with_album_links() {
+    let conn = test_conn();
+    populate_role_corrected_data(&conn);
+
+    // `query artist --name "U2"` → the agent, not a work.
+    let artists = query::search_artist(&conn, "U2").unwrap();
+    assert_eq!(artists.len(), 1, "Should resolve U2 via artist search");
+    assert_eq!(artists[0].id, "Q396");
+    assert_eq!(artists[0].name.as_deref(), Some("U2"));
+    assert_eq!(artists[0].artist_type, "group");
+
+    // album_artist links resolve the agent's albums (work → performer).
+    let albums = query::artist_albums(&conn, "Q396").unwrap();
+    assert_eq!(albums.len(), 1, "U2 should have 1 album via album_artist");
+    assert_eq!(albums[0].id, "Q152873");
+    assert_eq!(albums[0].name, "The Joshua Tree");
+    assert_eq!(albums[0].role.as_deref(), Some("performer"));
+}
+
+#[test]
+fn test_query_artist_not_surfaced_as_album() {
+    let conn = test_conn();
+    populate_role_corrected_data(&conn);
+
+    // Corrected roles: the agent must not surface as an album.
+    let albums = query::search_album(&conn, "U2").unwrap();
+    assert!(albums.is_empty(), "Agent must not surface as an album");
+}
+
+#[test]
+fn test_query_search_surfaces_tracks() {
+    let conn = test_conn();
+    populate_role_corrected_data(&conn);
+
+    // Track search surfaces the song work with its duration.
+    let tracks = query::search_track(&conn, "With or Without You").unwrap();
+    assert_eq!(tracks.len(), 1, "Should surface the track via track search");
+    assert_eq!(tracks[0].id, "Q155849");
+    assert_eq!(tracks[0].name, "With or Without You");
+    assert_eq!(tracks[0].duration_seconds, Some(275));
+
+    // The track surfaces from its parent album via track_album too.
+    let album_tracks = query::album_tracks(&conn, "Q152873").unwrap();
+    assert_eq!(album_tracks.len(), 1);
+    assert_eq!(album_tracks[0].id, "Q155849");
+    assert_eq!(album_tracks[0].name, "With or Without You");
+    assert_eq!(album_tracks[0].track_number, Some(1));
+}

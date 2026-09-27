@@ -41,7 +41,7 @@ pub struct ArtistSearchResult {
 pub struct AlbumSearchResult {
     /// Wikidata ID (e.g., "Q12345").
     pub id: String,
-    /// Album name (currently a Q-ID placeholder for unresolved albums).
+    /// Album name (the work's own English label, or a Q-ID mirror when no label or sitelink exists).
     pub name: String,
     /// Release date, or `None` if unavailable.
     pub release_date: Option<NaiveDate>,
@@ -52,7 +52,7 @@ pub struct AlbumSearchResult {
 pub struct TrackSearchResult {
     /// Wikidata ID (e.g., "Q67890").
     pub id: String,
-    /// Track name (currently a Q-ID placeholder for unresolved tracks).
+    /// Track name (the work's own English label, or a Q-ID mirror when no label or sitelink exists).
     pub name: String,
     /// Duration in seconds, or `None` if unavailable.
     pub duration_seconds: Option<i32>,
