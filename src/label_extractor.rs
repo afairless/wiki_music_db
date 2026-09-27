@@ -13,7 +13,9 @@
 //! - **Dates (P577)**: Wikidata full-precision dates parse normally; year-only
 //!   dates (precision 9) produce YYYY-01-01; coarser precisions (8, 7, 6)
 //!   produce NULL; unparseable dates produce NULL
-//! - **Durations (P2047)**: parsed to INTEGER seconds; unparseable → NULL
+//! - **Durations (P2047)**: parsed from the quantity `amount` to INTEGER
+//!   seconds when the unit is absent or resolves to seconds (`Q11574`);
+//!   otherwise NULL
 //! - **Genre links (P136 on albums)**: Q-ID pairs; both must be non-empty
 //! - **Track-album links (P361 on tracks)**: Q-ID pairs; both must be non-empty
 //!
@@ -563,32 +565,33 @@ fn parse_wikidata_date_with_precision(raw: &str, precision: Option<i64>) -> Opti
 
 /// Extract and parse a P2047 duration (in seconds) from claims.
 ///
-/// Returns the value as a string if it parses to an integer. Unparseable
-/// values are logged at WARN and stored as NULL.
+/// P2047 values are quantity-typed claims; the duration lives in the
+/// `amount` field of `mainsnak.datavalue` (e.g. `"+240"`). The amount is
+/// stripped of a leading `+`, parsed as an integer, and accepted only when
+/// the unit is absent or resolves to seconds (`Q11574`). Returns the value
+/// as a string. Claims that fail validation (missing/non-numeric amount or
+/// non-second unit) are logged at WARN and stored as NULL.
 fn extract_p2047_duration(claims: &[crate::wikidata::model::Claim]) -> Option<String> {
     for claim in claims {
         if let Some(dv) = claim.mainsnak.as_ref().and_then(|m| m.datavalue.as_ref()) {
-            // P2047 values are stored as quantity-typed claims. The value
-            // object has "amount" and "unit" fields. Our Mainsnak
-            // deserializer captures extended fields via the `extra` map.
-            // Try to extract the amount from the extra JSON.
-            if let Some(amount) = claim.extra.get("amount")
-                && let Some(amount_str) = amount.as_str()
+            let amount = dv.amount.as_ref().map(|a| a.trim_start_matches('+'));
+            if let Some(cleaned) = amount
+                && let Ok(seconds) = cleaned.parse::<i64>()
             {
-                let cleaned = amount_str.trim_start_matches('+');
-                if let Ok(seconds) = cleaned.parse::<i64>() {
+                // Accept bare amounts and explicit seconds (unit Q11574);
+                // reject other units (e.g. milliseconds Q1186222).
+                let unit_is_seconds = dv
+                    .unit
+                    .as_ref()
+                    .map(|u| u.ends_with("Q11574"))
+                    .unwrap_or(true);
+                if unit_is_seconds {
                     return Some(seconds.to_string());
                 }
             }
-
-            // Fallback: try the time field (some entries store duration there)
-            if let Some(time) = &dv.time
-                && let Ok(seconds) = time.parse::<i64>()
-            {
-                return Some(seconds.to_string());
-            }
         }
     }
+    tracing::warn!("P2047 duration missing, non-integer, or non-second unit; storing as NULL");
     None
 }
 
@@ -901,51 +904,66 @@ mod tests {
     // P2047 duration extraction tests
     // -------------------------------------------------------------------
 
-    #[test]
-    fn test_extract_claim_p2047() {
-        // P2047 values are stored as quantity-typed claims.
-        // Build a claim with the amount in the extra map.
-        let claims = vec![Claim {
+    /// Helper: build a claim with a P2047-like quantity datavalue.
+    fn make_quantity_claim(amount: Option<&str>, unit: Option<&str>) -> Vec<Claim> {
+        vec![Claim {
             mainsnak: Some(Mainsnak {
                 snaktype: "value".into(),
                 datavalue: Some(DatavalueValue {
-                    amount: None,
-                    unit: None,
+                    amount: amount.map(|a| a.into()),
+                    unit: unit.map(|u| u.into()),
                     id: None,
                     time: None,
                     precision: None,
                 }),
             }),
-            extra: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "amount".to_string(),
-                    serde_json::Value::String("+120".to_string()),
-                );
-                m
-            },
-        }];
+            extra: HashMap::new(),
+        }]
+    }
+
+    #[test]
+    fn test_extract_claim_p2047() {
+        // P2047 values are quantity-typed claims: the duration lives in
+        // `mainsnak.datavalue.amount`, e.g. "+240" with a seconds unit.
+        let claims =
+            make_quantity_claim(Some("+240"), Some("http://www.wikidata.org/entity/Q11574"));
         let duration = extract_p2047_duration(&claims);
-        assert_eq!(duration, Some("120".to_string()));
+        assert_eq!(duration, Some("240".to_string()));
+    }
+
+    #[test]
+    fn test_extract_claim_p2047_no_unit() {
+        // A bare amount without a unit is accepted per the duration contract.
+        let claims = make_quantity_claim(Some("+240"), None);
+        let duration = extract_p2047_duration(&claims);
+        assert_eq!(duration, Some("240".to_string()));
     }
 
     #[test]
     fn test_extract_claim_p2047_invalid() {
-        let claims = vec![Claim {
-            mainsnak: Some(Mainsnak {
-                snaktype: "value".into(),
-                datavalue: Some(DatavalueValue {
-                    amount: None,
-                    unit: None,
-                    id: None,
-                    time: Some("not-a-number".to_string()),
-                    precision: None,
-                }),
-            }),
-            extra: HashMap::new(),
-        }];
+        // Non-numeric amounts are unparseable → NULL.
+        let claims = make_quantity_claim(Some("not-a-number"), None);
         let duration = extract_p2047_duration(&claims);
         assert_eq!(duration, None);
+    }
+
+    #[test]
+    fn test_extract_claim_p2047_missing_amount() {
+        // A claim with no amount cannot yield a duration → NULL.
+        let claims = make_quantity_claim(None, None);
+        let duration = extract_p2047_duration(&claims);
+        assert_eq!(duration, None);
+    }
+
+    #[test]
+    fn test_extract_claim_p2047_non_second_unit() {
+        // Milliseconds (Q1186222) and other non-second units → NULL.
+        let claims = make_quantity_claim(
+            Some("+240"),
+            Some("http://www.wikidata.org/entity/Q1186222"),
+        );
+        let duration = extract_p2047_duration(&claims);
+        assert_eq!(duration, None, "Non-second units should be stored as NULL");
     }
 
     // -------------------------------------------------------------------
