@@ -20,7 +20,9 @@ const BINARY_PATH: &str = env!("CARGO_BIN_EXE_wiki_db");
 /// - Q42 (Douglas Adams) — non-musician (P31:Q5) → excluded
 /// - Q23215 (Adele) — musician with P106 and P1303 instrument
 /// - Q99901 (Fictional Genre Entity) — catch-all via P136 only
-/// - Q99902 (Entity With All Catch-All) — P1303, P175, P136, P358
+/// - Q99902 (Entity With All Catch-All) — P1303, P175, P136, P358 (catch-all → Agent)
+/// - Q152873 (The Joshua Tree) — album work (P31:Q482994) with P175 performer and P136 genre
+/// - Q123456 (Test Track) — song work (P31:Q7366) with P175 performer and P361 parent album
 /// - A malformed line → rejected
 /// - Q90 (Paris) — non-musician (P31:Q5) → excluded
 fn create_fixture(dir: &Path) -> PathBuf {
@@ -36,6 +38,8 @@ fn create_fixture(dir: &Path) -> PathBuf {
 {"id":"Q23215","type":"item","labels":{"en":{"value":"Adele"}},"descriptions":{"en":{"value":"English singer"}},"claims":{"P106":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q639669"}}}}],"P1303":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q171"}}}}]}},
 {"id":"Q99901","type":"item","labels":{"en":{"value":"Fictional Genre Entity"}},"claims":{"P136":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q35718"}}}}]}},
 {"id":"Q99902","type":"item","labels":{"en":{"value":"Entity With All Catch-All Properties"}},"claims":{"P1303":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q171"}}}}],"P175":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q12345"}}}}],"P136":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q35718"}}}}],"P358":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q67890"}}}}]}},
+{"id":"Q152873","type":"item","labels":{"en":{"value":"The Joshua Tree"}},"descriptions":{"en":{"value":"1987 studio album by U2"}},"claims":{"P31":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q482994"}}}}],"P175":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q2831"}}}}],"P136":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q35718"}}}}]}},
+{"id":"Q123456","type":"item","labels":{"en":{"value":"Test Track"}},"claims":{"P31":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q7366"}}}}],"P175":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q2831"}}}}],"P361":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q152873"}}}}]}},
 {"id":"Q99999","type":"item","claims": broken},
 {"id":"Q90","type":"item","labels":{"en":{"value":"Paris"}},"descriptions":{"en":{"value":"Capital of France"}},"claims":{"P31":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q5"}}}}]}}
 ]"#;
@@ -121,13 +125,17 @@ fn test_bootstrap_populates_all_tables() {
     // Q2831 (P106:Q639669), Q11649 (P31:Q215380),
     // Q23215 (P106:Q639669), Q99901 (P136 catch-all), Q99902 (catch-all)
     // Note: Q35718 has empty claims so it's not filtered
+    // Q152873 (P31:Q482994) and Q123456 (P31:Q7366) are work entities —
+    // they are filtered but routed to album/track, never to artist.
     // = 5 artists
     assert_eq!(table_count(&conn, "artist"), 5, "Expected 5 artists");
 
     // 1 genre with label: Q35718 (jazz)
     assert_eq!(table_count(&conn, "genre"), 1, "Expected 1 genre");
 
-    // artist_genre: Q2831→Q35718, Q99901→Q35718, Q99902→Q35718 = 3 rows
+    // artist_genre: Q2831→Q35718, Q99901→Q35718, Q99902→Q35718 = 3 rows.
+    // Q152873 (album work) also carries P136:Q35718 but the loader's
+    // role='Agent' filter keeps work genres out of artist_genre.
     assert_eq!(
         table_count(&conn, "artist_genre"),
         3,
@@ -148,23 +156,59 @@ fn test_bootstrap_populates_all_tables() {
         "Expected 0 artist_member_of rows"
     );
 
-    // Agents no longer absorb P175 as "albums" (role-inversion fix):
-    // Q99902's P175 points at a performer and is dropped at extraction,
-    // so no album stubs or junctions are produced.
-    assert_eq!(table_count(&conn, "album"), 0, "Expected 0 albums");
+    // Album/track rows come from work entities routed by role — never from
+    // agent P175 refs (role-inversion fix). Q152873 is an Album-role work,
+    // Q123456 a Track-role work.
+    assert_eq!(
+        table_count(&conn, "album"),
+        1,
+        "Expected 1 album (work entity)"
+    );
     assert_eq!(
         table_count(&conn, "album_artist"),
-        0,
-        "Expected 0 album_artist rows"
+        1,
+        "Expected 1 album_artist row (album → performer)"
     );
-
-    // Tracks: none in fixture (no P658 claims)
-    assert_eq!(table_count(&conn, "track"), 0, "Expected 0 tracks");
+    assert_eq!(
+        table_count(&conn, "track"),
+        1,
+        "Expected 1 track (work entity)"
+    );
     assert_eq!(
         table_count(&conn, "track_artist"),
-        0,
-        "Expected 0 track_artist rows"
+        1,
+        "Expected 1 track_artist row (track → performer)"
     );
+    assert_eq!(
+        table_count(&conn, "track_album"),
+        1,
+        "Expected 1 track_album row (track → P361 parent)"
+    );
+
+    // Work names come from the dump labels (COALESCE(name, id)):
+    // queryable before `populate`.
+    let album_name: String = conn
+        .query_row("SELECT name FROM album WHERE id = 'Q152873'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(album_name, "The Joshua Tree");
+    let track_name: String = conn
+        .query_row("SELECT name FROM track WHERE id = 'Q123456'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(track_name, "Test Track");
+
+    // Role separation: no Q-ID is both album and artist.
+    let overlap: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM album a JOIN artist ar ON a.id = ar.id",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(overlap, 0, "No Q-ID may be both album and artist");
 
     // Parquet directory should still exist (no --cleanup-parquet)
     assert!(parquet_dir.exists(), "Parquet dir should exist");

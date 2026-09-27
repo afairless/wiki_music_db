@@ -9,8 +9,8 @@
 //! 1. `genre` — genre taxonomy (referenced by `artist_genre`)
 //! 2. `artist` — core entities (referenced by join tables)
 //! 3. `artist_genre`, `artist_instrument`, `artist_member_of` — artist join tables
-//! 4. `album`, `track` — entity stubs from JSON columns
-//! 5. `album_artist`, `track_artist` — entity join tables
+//! 4. `album`, `track` — work rows routed by their `role` column
+//! 5. `album_artist`, `track_artist`, `track_album` — performer/parent junctions
 //!
 //! ## Idempotency
 //!
@@ -509,6 +509,10 @@ pub fn load_genres(conn: &Connection, parquet_dir: &Path) -> Result<usize> {
 /// and inserts into `artist (id, name, description, artist_type,
 /// inclusion_reason, birth_date, death_date)`.
 ///
+/// Only `role = 'Agent'` rows are loaded — album/track works must never land
+/// in `artist` (role-routing fix), otherwise work rows with P136 genres would
+/// violate the artist-side foreign keys in the join loaders.
+///
 /// Date VARCHAR columns are cast to `DATE` using DuckDB's `::DATE` syntax,
 /// with NULL handling for empty strings.
 ///
@@ -528,7 +532,8 @@ pub fn load_artists(conn: &Connection, parquet_dir: &Path) -> Result<usize> {
          SELECT id, name, description, artist_type, inclusion_reason,
                 CASE WHEN birth_date IS NOT NULL AND birth_date != '' THEN birth_date::DATE ELSE NULL END,
                 CASE WHEN death_date IS NOT NULL AND death_date != '' THEN death_date::DATE ELSE NULL END
-         FROM read_parquet('{parquet_dir_str}/part-*.parquet')"
+         FROM read_parquet('{parquet_dir_str}/part-*.parquet')
+         WHERE role = 'Agent'"
     );
 
     conn.execute(&sql, [])
@@ -545,6 +550,8 @@ pub fn load_artists(conn: &Connection, parquet_dir: &Path) -> Result<usize> {
 ///
 /// Parses the `genres` VARCHAR column from the artist Parquet files using
 /// DuckDB's `string_split` + `unnest`, and inserts into `artist_genre`.
+/// Only `role = 'Agent'` rows contribute — work rows carry P136 genres but
+/// must not be linked as `artist_id` (foreign-key contract).
 ///
 /// Returns the total number of rows in the `artist_genre` table after load.
 ///
@@ -567,6 +574,7 @@ pub fn load_artist_genre(conn: &Connection, parquet_dir: &Path) -> Result<usize>
              SELECT a.id, unnest(string_split(a.genres, '|')) as genre_qid
              FROM read_parquet('{parquet_dir_str}/part-*.parquet') a
              WHERE a.genres IS NOT NULL AND a.genres != ''
+               AND a.role = 'Agent'
          ) sq
          WHERE sq.genre_qid IN (SELECT id FROM genre)"
     );
@@ -585,6 +593,7 @@ pub fn load_artist_genre(conn: &Connection, parquet_dir: &Path) -> Result<usize>
 ///
 /// Parses the `instruments` VARCHAR column from the artist Parquet files using
 /// DuckDB's `string_split` + `unnest`, and inserts into `artist_instrument`.
+/// Only `role = 'Agent'` rows contribute (see `load_artist_genre`).
 ///
 /// Returns the total number of rows in the `artist_instrument` table after load.
 ///
@@ -601,7 +610,8 @@ pub fn load_artist_instrument(conn: &Connection, parquet_dir: &Path) -> Result<u
         "INSERT OR IGNORE INTO artist_instrument (artist_id, instrument_id)
          SELECT a.id, unnest(string_split(a.instruments, '|'))
          FROM read_parquet('{parquet_dir_str}/part-*.parquet') a
-         WHERE a.instruments IS NOT NULL AND a.instruments != ''"
+         WHERE a.instruments IS NOT NULL AND a.instruments != ''
+           AND a.role = 'Agent'"
     );
 
     conn.execute(&sql, [])
@@ -620,6 +630,7 @@ pub fn load_artist_instrument(conn: &Connection, parquet_dir: &Path) -> Result<u
 ///
 /// Parses the `member_of` VARCHAR column from the artist Parquet files using
 /// DuckDB's `string_split` + `unnest`, and inserts into `artist_member_of`.
+/// Only `role = 'Agent'` rows contribute (see `load_artist_genre`).
 ///
 /// Returns the total number of rows in the `artist_member_of` table after load.
 ///
@@ -641,6 +652,7 @@ pub fn load_artist_member_of(conn: &Connection, parquet_dir: &Path) -> Result<us
              SELECT a.id, unnest(string_split(a.member_of, '|')) as member_qid
              FROM read_parquet('{parquet_dir_str}/part-*.parquet') a
              WHERE a.member_of IS NOT NULL AND a.member_of != ''
+               AND a.role = 'Agent'
          ) sq
          WHERE sq.member_qid IN (SELECT id FROM artist)"
     );
@@ -657,14 +669,22 @@ pub fn load_artist_member_of(conn: &Connection, parquet_dir: &Path) -> Result<us
     Ok(count)
 }
 
-/// Load album and track stub entries from JSON array columns.
+/// Load album and track rows from work entities, routed by their `role` column.
 ///
-/// Parses the `albums` and `tracks` JSON VARCHAR columns from the artist
-/// Parquet files using DuckDB's `json_each` + `json_extract_string`. Creates
-/// stub entries in `album`, `album_artist`, `track`, and `track_artist` tables.
+/// `album`/`track` rows come only from Album-/Track-role rows in the entity
+/// Parquet files — never from agent P175 refs (that was the historical role
+/// inversion). The `albums` JSON column on work rows holds [`PerformerRef`]s
+/// (the work's featured performers) which feed `album_artist`/`track_artist`;
+/// the `parents` JSON column on Track rows holds P361 parent-album Q-IDs
+/// which feed `track_album` (one row per parent).
 ///
-/// Album and track names use the Q-ID as a placeholder (a future phase can
-/// resolve actual names via a second pass over the dump or a SPARQL query).
+/// Names use `COALESCE(name, id)`: the work's own (English) label when present
+/// in the dump, else the Q-ID as a placeholder for a later `populate` pass.
+///
+/// Performer junctions are FK-guarded — a performer that did not load into
+/// `artist` (agent role) is dropped rather than raising a foreign-key error,
+/// matching the enrichment-loader guards. Track parents are likewise guarded
+/// against `album`.
 ///
 /// Returns `(album_count, track_count)` — the total rows in each table after load.
 ///
@@ -677,63 +697,77 @@ pub fn load_albums_and_tracks(conn: &Connection, parquet_dir: &Path) -> Result<(
         .to_str()
         .context("Parquet directory path contains invalid UTF-8")?;
 
-    // Load album stubs
+    // Album works (role='Album') become album rows with COALESCE(name, id).
     let album_sql = format!(
         "INSERT OR IGNORE INTO album (id, name)
-         SELECT DISTINCT
-             json_extract_string(value, '$.album_id') as id,
-             json_extract_string(value, '$.album_id') as name
-         FROM read_parquet('{parquet_dir_str}/part-*.parquet'),
-         LATERAL json_each(albums)
-         WHERE albums IS NOT NULL AND albums != '[]'"
+         SELECT id, COALESCE(name, id)
+         FROM read_parquet('{parquet_dir_str}/part-*.parquet')
+         WHERE role = 'Album'"
     );
 
     conn.execute(&album_sql, [])
         .context("Failed to load albums from Parquet")?;
 
-    // Load album_artist join table
+    // album_artist: an Album row's albums JSON lists its featured performers.
     let album_artist_sql = format!(
         "INSERT OR IGNORE INTO album_artist (album_id, artist_id, role)
          SELECT
-             json_extract_string(value, '$.album_id') as album_id,
-             a.id as artist_id,
+             a.id as album_id,
+             json_extract_string(value, '$.qid') as artist_id,
              json_extract_string(value, '$.role') as role
          FROM read_parquet('{parquet_dir_str}/part-*.parquet') a,
          LATERAL json_each(a.albums)
-         WHERE a.albums IS NOT NULL AND a.albums != '[]'"
+         WHERE a.role = 'Album'
+           AND a.albums IS NOT NULL AND a.albums != '[]'
+           AND json_extract_string(value, '$.qid') IN (SELECT id FROM artist)"
     );
 
     conn.execute(&album_artist_sql, [])
         .context("Failed to load album_artist from Parquet")?;
 
-    // Load track stubs
+    // Track works (role='Track') become track rows with COALESCE(name, id).
     let track_sql = format!(
         "INSERT OR IGNORE INTO track (id, name)
-         SELECT DISTINCT
-             json_extract_string(value, '$.track_id') as id,
-             json_extract_string(value, '$.track_id') as name
-         FROM read_parquet('{parquet_dir_str}/part-*.parquet'),
-         LATERAL json_each(tracks)
-         WHERE tracks IS NOT NULL AND tracks != '[]'"
+         SELECT id, COALESCE(name, id)
+         FROM read_parquet('{parquet_dir_str}/part-*.parquet')
+         WHERE role = 'Track'"
     );
 
     conn.execute(&track_sql, [])
         .context("Failed to load tracks from Parquet")?;
 
-    // Load track_artist join table
+    // track_artist: a Track row's albums JSON lists its featured performers.
     let track_artist_sql = format!(
         "INSERT OR IGNORE INTO track_artist (track_id, artist_id, role)
          SELECT
-             json_extract_string(value, '$.track_id') as track_id,
-             a.id as artist_id,
+             a.id as track_id,
+             json_extract_string(value, '$.qid') as artist_id,
              json_extract_string(value, '$.role') as role
          FROM read_parquet('{parquet_dir_str}/part-*.parquet') a,
-         LATERAL json_each(a.tracks)
-         WHERE a.tracks IS NOT NULL AND a.tracks != '[]'"
+         LATERAL json_each(a.albums)
+         WHERE a.role = 'Track'
+           AND a.albums IS NOT NULL AND a.albums != '[]'
+           AND json_extract_string(value, '$.qid') IN (SELECT id FROM artist)"
     );
 
     conn.execute(&track_artist_sql, [])
         .context("Failed to load track_artist from Parquet")?;
+
+    // track_album: a Track row's parents JSON lists its P361 parent-album Q-IDs.
+    let track_album_sql = format!(
+        "INSERT OR IGNORE INTO track_album (track_id, album_id)
+         SELECT DISTINCT
+             a.id as track_id,
+             json_extract_string(value, '$') as album_id
+         FROM read_parquet('{parquet_dir_str}/part-*.parquet') a,
+         LATERAL json_each(a.parents)
+         WHERE a.role = 'Track'
+           AND a.parents IS NOT NULL AND a.parents != '[]'
+           AND json_extract_string(value, '$') IN (SELECT id FROM album)"
+    );
+
+    conn.execute(&track_album_sql, [])
+        .context("Failed to load track_album from Parquet")?;
 
     let album_count: usize = conn
         .query_row("SELECT COUNT(*) FROM album", [], |row| row.get(0))
@@ -1049,6 +1083,8 @@ mod tests {
             Field::new("member_of", DataType::Utf8, false),
             Field::new("albums", DataType::Utf8, false),
             Field::new("tracks", DataType::Utf8, false),
+            Field::new("role", DataType::Utf8, false),
+            Field::new("parents", DataType::Utf8, false),
         ]));
 
         let mut id_builder = StringBuilder::new();
@@ -1063,6 +1099,8 @@ mod tests {
         let mut member_builder = StringBuilder::new();
         let mut albums_builder = StringBuilder::new();
         let mut tracks_builder = StringBuilder::new();
+        let mut role_builder = StringBuilder::new();
+        let mut parents_builder = StringBuilder::new();
 
         // Entity 1: Ivy Queen — full data with genres, instruments, member_of
         id_builder.append_value("Q2831");
@@ -1077,6 +1115,8 @@ mod tests {
         member_builder.append_value("Q11649");
         albums_builder.append_value("[]");
         tracks_builder.append_value("[]");
+        role_builder.append_value("Agent");
+        parents_builder.append_value("[]");
 
         // Entity 2: empty pipe columns
         id_builder.append_value("Q99999");
@@ -1091,6 +1131,8 @@ mod tests {
         member_builder.append_value("");
         albums_builder.append_value("[]");
         tracks_builder.append_value("[]");
+        role_builder.append_value("Agent");
+        parents_builder.append_value("[]");
 
         // Entity 3: one genre Q57251, one instrument Q171, no member_of
         id_builder.append_value("Q12345");
@@ -1105,6 +1147,8 @@ mod tests {
         member_builder.append_value("");
         albums_builder.append_value("[]");
         tracks_builder.append_value("[]");
+        role_builder.append_value("Agent");
+        parents_builder.append_value("[]");
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -1121,6 +1165,8 @@ mod tests {
                 Arc::new(member_builder.finish()),
                 Arc::new(albums_builder.finish()),
                 Arc::new(tracks_builder.finish()),
+                Arc::new(role_builder.finish()),
+                Arc::new(parents_builder.finish()),
             ],
         )
         .unwrap();
@@ -1449,7 +1495,12 @@ mod tests {
     // load_albums_and_tracks tests
     // -----------------------------------------------------------------------
 
-    /// Helper: write a Parquet file with album and track JSON data.
+    /// Helper: write a role-mixed Parquet file with agent, album, and track rows.
+    ///
+    /// - Q2831: Agent (Ivy Queen, performer on the album/track below)
+    /// - Q99999: Agent referenced by the album as a second performer
+    /// - Q123: Album work "Test Album" with two performer refs
+    /// - Q456: Track work "Test Track" with one performer ref and parent Q123
     fn write_test_albums_tracks_parquet(dir: &Path) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
@@ -1464,6 +1515,8 @@ mod tests {
             Field::new("member_of", DataType::Utf8, false),
             Field::new("albums", DataType::Utf8, false),
             Field::new("tracks", DataType::Utf8, false),
+            Field::new("role", DataType::Utf8, false),
+            Field::new("parents", DataType::Utf8, false),
         ]));
 
         let mut id_builder = StringBuilder::new();
@@ -1478,8 +1531,10 @@ mod tests {
         let mut member_builder = StringBuilder::new();
         let mut albums_builder = StringBuilder::new();
         let mut tracks_builder = StringBuilder::new();
+        let mut role_builder = StringBuilder::new();
+        let mut parents_builder = StringBuilder::new();
 
-        // Entity 1: has one album and one track
+        // Entity 1: Agent — Ivy Queen, performer on the album/track works.
         id_builder.append_value("Q2831");
         name_builder.append_value("Ivy Queen");
         desc_builder.append_value("American singer-songwriter");
@@ -1490,10 +1545,12 @@ mod tests {
         genres_builder.append_value("");
         instruments_builder.append_value("");
         member_builder.append_value("");
-        albums_builder.append_value(r#"[{"album_id":"Q123","role":"performer"}]"#);
-        tracks_builder.append_value(r#"[{"track_id":"Q456","role":"performer"}]"#);
+        albums_builder.append_value("[]");
+        tracks_builder.append_value("[]");
+        role_builder.append_value("Agent");
+        parents_builder.append_value("[]");
 
-        // Entity 2: references same album, empty tracks
+        // Entity 2: Agent referenced by the album as a second (featured) performer.
         id_builder.append_value("Q99999");
         name_builder.append_null();
         desc_builder.append_null();
@@ -1504,22 +1561,44 @@ mod tests {
         genres_builder.append_value("");
         instruments_builder.append_value("");
         member_builder.append_value("");
-        albums_builder.append_value(r#"[{"album_id":"Q123","role":"featured"}]"#);
+        albums_builder.append_value("[]");
         tracks_builder.append_value("[]");
+        role_builder.append_value("Agent");
+        parents_builder.append_value("[]");
 
-        // Entity 3: empty albums and tracks
-        id_builder.append_value("Q12345");
-        name_builder.append_value("Test Artist");
+        // Entity 3: Album work — its albums JSON lists its featured performers.
+        id_builder.append_value("Q123");
+        name_builder.append_value("Test Album");
         desc_builder.append_null();
-        type_builder.append_value("group");
-        reason_builder.append_value("P31:Q215380");
+        type_builder.append_value("person");
+        reason_builder.append_value("P31:Q482994");
         birth_builder.append_null();
         death_builder.append_null();
         genres_builder.append_value("");
         instruments_builder.append_value("");
         member_builder.append_value("");
-        albums_builder.append_value("[]");
+        albums_builder.append_value(
+            r#"[{"qid":"Q2831","role":"performer"},{"qid":"Q99999","role":"featured"}]"#,
+        );
         tracks_builder.append_value("[]");
+        role_builder.append_value("Album");
+        parents_builder.append_value("[]");
+
+        // Entity 4: Track work — one performer ref and one P361 parent album.
+        id_builder.append_value("Q456");
+        name_builder.append_value("Test Track");
+        desc_builder.append_null();
+        type_builder.append_value("person");
+        reason_builder.append_value("P31:Q7366");
+        birth_builder.append_null();
+        death_builder.append_null();
+        genres_builder.append_value("");
+        instruments_builder.append_value("");
+        member_builder.append_value("");
+        albums_builder.append_value(r#"[{"qid":"Q2831","role":"performer"}]"#);
+        tracks_builder.append_value("[]");
+        role_builder.append_value("Track");
+        parents_builder.append_value(r#"["Q123"]"#);
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -1536,11 +1615,13 @@ mod tests {
                 Arc::new(member_builder.finish()),
                 Arc::new(albums_builder.finish()),
                 Arc::new(tracks_builder.finish()),
+                Arc::new(role_builder.finish()),
+                Arc::new(parents_builder.finish()),
             ],
         )
         .unwrap();
 
-        let path = dir.join("part-00001.parquet");
+        let path = dir.join("part-00002.parquet");
         let file = fs::File::create(&path).unwrap();
         let props = WriterProperties::builder().build();
         let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
@@ -1557,18 +1638,22 @@ mod tests {
         load_artists(&conn, dir.path()).unwrap();
         let (albums, _) = load_albums_and_tracks(&conn, dir.path()).unwrap();
 
-        // One distinct album Q123 referenced by two artists
+        // One album row from the Album-role work Q123 (not from agent P175).
         assert_eq!(albums, 1, "Expected 1 album row");
 
-        // Verify album content
+        // Verify album content: name comes from the work's own label via
+        // COALESCE(name, id) — no more Q-ID placeholders when a label exists.
         let album_name: String = conn
             .query_row("SELECT name FROM album WHERE id = 'Q123'", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(album_name, "Q123", "Album name should be Q-ID placeholder");
+        assert_eq!(
+            album_name, "Test Album",
+            "Album name should come from the work row"
+        );
 
-        // Verify album_artist has 2 rows
+        // Verify album_artist has 2 rows (one per performer ref on the work).
         let aa_count: usize = conn
             .query_row("SELECT COUNT(*) FROM album_artist", [], |row| row.get(0))
             .unwrap();
@@ -1594,10 +1679,10 @@ mod tests {
         load_artists(&conn, dir.path()).unwrap();
         let (albums, _) = load_albums_and_tracks(&conn, dir.path()).unwrap();
 
-        // Only one distinct album
-        assert_eq!(albums, 1, "Expected 1 album row from two references");
+        // One album row carrying two performer refs.
+        assert_eq!(albums, 1, "Expected 1 album row");
 
-        // Two album_artist entries
+        // Two album_artist entries, both on the same album row.
         let aa_count: usize = conn
             .query_row("SELECT COUNT(*) FROM album_artist", [], |row| row.get(0))
             .unwrap();
@@ -1607,7 +1692,9 @@ mod tests {
     #[test]
     fn test_load_albums_empty() {
         let dir = tempfile::tempdir().unwrap();
-        // Write a Parquet file with only empty-album entity
+        // Write a Parquet file with a single Agent row and empty JSON columns.
+        // Agents must never create album/track rows (no more stubs from
+        // catch-all P175-ish entities).
         let empty_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("name", DataType::Utf8, true),
@@ -1621,6 +1708,8 @@ mod tests {
             Field::new("member_of", DataType::Utf8, false),
             Field::new("albums", DataType::Utf8, false),
             Field::new("tracks", DataType::Utf8, false),
+            Field::new("role", DataType::Utf8, false),
+            Field::new("parents", DataType::Utf8, false),
         ]));
 
         let mut b0 = StringBuilder::new();
@@ -1647,6 +1736,10 @@ mod tests {
         b10.append_value("[]");
         let mut b11 = StringBuilder::new();
         b11.append_value("[]");
+        let mut b12 = StringBuilder::new();
+        b12.append_value("Agent");
+        let mut b13 = StringBuilder::new();
+        b13.append_value("[]");
 
         let batch = RecordBatch::try_new(
             empty_schema.clone(),
@@ -1663,6 +1756,8 @@ mod tests {
                 Arc::new(b9.finish()),
                 Arc::new(b10.finish()),
                 Arc::new(b11.finish()),
+                Arc::new(b12.finish()),
+                Arc::new(b13.finish()),
             ],
         )
         .unwrap();
@@ -1677,8 +1772,102 @@ mod tests {
         let conn = test_conn();
         load_artists(&conn, dir.path()).unwrap();
         let (albums, tracks) = load_albums_and_tracks(&conn, dir.path()).unwrap();
-        assert_eq!(albums, 0, "Expected 0 album rows from empty JSON");
-        assert_eq!(tracks, 0, "Expected 0 track rows from empty JSON");
+        assert_eq!(albums, 0, "Expected 0 album rows from an Agent-only file");
+        assert_eq!(tracks, 0, "Expected 0 track rows from an Agent-only file");
+    }
+
+    #[test]
+    fn test_load_album_without_performer_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        // An Album-role row with no performers must still create the album row
+        // (role routing reads the role column, not the albums JSON).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("description", DataType::Utf8, true),
+            Field::new("artist_type", DataType::Utf8, false),
+            Field::new("inclusion_reason", DataType::Utf8, false),
+            Field::new("birth_date", DataType::Utf8, true),
+            Field::new("death_date", DataType::Utf8, true),
+            Field::new("genres", DataType::Utf8, false),
+            Field::new("instruments", DataType::Utf8, false),
+            Field::new("member_of", DataType::Utf8, false),
+            Field::new("albums", DataType::Utf8, false),
+            Field::new("tracks", DataType::Utf8, false),
+            Field::new("role", DataType::Utf8, false),
+            Field::new("parents", DataType::Utf8, false),
+        ]));
+        let mut b0 = StringBuilder::new();
+        b0.append_value("Q777");
+        let mut b1 = StringBuilder::new();
+        b1.append_value("Solo Album");
+        let mut b2 = StringBuilder::new();
+        b2.append_null();
+        let mut b3 = StringBuilder::new();
+        b3.append_value("person");
+        let mut b4 = StringBuilder::new();
+        b4.append_value("P31:Q482994");
+        let mut b5 = StringBuilder::new();
+        b5.append_null();
+        let mut b6 = StringBuilder::new();
+        b6.append_null();
+        let mut b7 = StringBuilder::new();
+        b7.append_value("");
+        let mut b8 = StringBuilder::new();
+        b8.append_value("");
+        let mut b9 = StringBuilder::new();
+        b9.append_value("");
+        let mut b10 = StringBuilder::new();
+        b10.append_value("[]");
+        let mut b11 = StringBuilder::new();
+        b11.append_value("[]");
+        let mut b12 = StringBuilder::new();
+        b12.append_value("Album");
+        let mut b13 = StringBuilder::new();
+        b13.append_value("[]");
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(b0.finish()),
+                Arc::new(b1.finish()),
+                Arc::new(b2.finish()),
+                Arc::new(b3.finish()),
+                Arc::new(b4.finish()),
+                Arc::new(b5.finish()),
+                Arc::new(b6.finish()),
+                Arc::new(b7.finish()),
+                Arc::new(b8.finish()),
+                Arc::new(b9.finish()),
+                Arc::new(b10.finish()),
+                Arc::new(b11.finish()),
+                Arc::new(b12.finish()),
+                Arc::new(b13.finish()),
+            ],
+        )
+        .unwrap();
+
+        let path = dir.path().join("part-00001.parquet");
+        let file = fs::File::create(&path).unwrap();
+        let props = WriterProperties::builder().build();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let conn = test_conn();
+        let (albums, tracks) = load_albums_and_tracks(&conn, dir.path()).unwrap();
+        assert_eq!(albums, 1, "Expected 1 album row from the Album-role work");
+        assert_eq!(tracks, 0, "Expected 0 track rows");
+        let aa_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM album_artist", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(aa_count, 0, "No performer refs means no album_artist rows");
+        let name: String = conn
+            .query_row("SELECT name FROM album WHERE id = 'Q777'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "Solo Album");
     }
 
     #[test]
@@ -1690,22 +1879,45 @@ mod tests {
         load_artists(&conn, dir.path()).unwrap();
         let (_, tracks) = load_albums_and_tracks(&conn, dir.path()).unwrap();
 
-        // One distinct track Q456
+        // One distinct track row from the Track-role work Q456.
         assert_eq!(tracks, 1, "Expected 1 track row");
 
-        // Verify track_artist
-        let ta_count: usize = conn
-            .query_row("SELECT COUNT(*) FROM track_artist", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(ta_count, 1, "Expected 1 track_artist row");
-
-        // Verify track name is Q-ID placeholder
+        // Verify track name comes from the work's own label.
         let track_name: String = conn
             .query_row("SELECT name FROM track WHERE id = 'Q456'", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(track_name, "Q456");
+        assert_eq!(track_name, "Test Track");
+
+        // Verify track_artist (performer ref) and track_album (P361 parent).
+        let ta_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM track_artist", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ta_count, 1, "Expected 1 track_artist row");
+
+        let ta_artist: String = conn
+            .query_row(
+                "SELECT artist_id FROM track_artist WHERE track_id = 'Q456'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ta_artist, "Q2831");
+
+        let talbum_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM track_album", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(talbum_count, 1, "Expected 1 track_album row");
+
+        let parent_album: String = conn
+            .query_row(
+                "SELECT album_id FROM track_album WHERE track_id = 'Q456'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_album, "Q123");
     }
 
     #[test]
@@ -1719,6 +1931,83 @@ mod tests {
 
         assert_eq!(albums, 1, "Expected 1 album");
         assert_eq!(tracks, 1, "Expected 1 track");
+    }
+
+    #[test]
+    fn test_load_albums_and_tracks_role_separation() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_albums_tracks_parquet(dir.path());
+        let conn = test_conn();
+
+        load_artists(&conn, dir.path()).unwrap();
+        let (albums, tracks) = load_albums_and_tracks(&conn, dir.path()).unwrap();
+        assert_eq!(albums, 1, "Expected 1 album");
+        assert_eq!(tracks, 1, "Expected 1 track");
+
+        // Agents only in artist; works never land there (Q123/Q456 are works).
+        let works_in_artist: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artist WHERE id IN ('Q123', 'Q456')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(works_in_artist, 0, "Work rows must never land in artist");
+
+        // Works only in album/track; agents never land there.
+        let agents_in_album: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM album WHERE id IN ('Q2831', 'Q99999')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(agents_in_album, 0, "Agent rows must never land in album");
+
+        let agents_in_track: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM track WHERE id IN ('Q2831', 'Q99999')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(agents_in_track, 0, "Agent rows must never land in track");
+
+        // The album.id ∩ artist.id intersection stays empty (role separation).
+        let overlap: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM album a JOIN artist ar ON a.id = ar.id",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(overlap, 0, "No Q-ID may be both album and artist");
+
+        // FK smiles: every junction references an existing row.
+        let orphan_aa: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM album_artist aa LEFT JOIN artist a ON aa.artist_id = a.id WHERE a.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_aa, 0, "No orphaned album_artist artist refs");
+        let orphan_ta: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM track_artist ta LEFT JOIN artist a ON ta.artist_id = a.id WHERE a.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_ta, 0, "No orphaned track_artist artist refs");
+        let orphan_tal: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM track_album tal LEFT JOIN album al ON tal.album_id = al.id WHERE al.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_tal, 0, "No orphaned track_album album refs");
     }
 
     #[test]
@@ -1757,6 +2046,59 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM track", [], |row| row.get(0))
             .unwrap();
         assert_eq!(track_count, 1, "Expected 1 track");
+
+        // Work junctions loaded once (album_artist from the album's performer
+        // refs, track_artist from the track's, track_album from its parents).
+        let aa_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM album_artist", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(aa_count, 2, "Expected 2 album_artist rows");
+        let ta_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM track_artist", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ta_count, 1, "Expected 1 track_artist row");
+        let talbum_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM track_album", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(talbum_count, 1, "Expected 1 track_album row");
+
+        // Artist-role filters: album/track rows carry no genres, but the role
+        // filter still keeps artist-side joins confined to agents.
+        let ag_count: usize = conn
+            .query_row("SELECT COUNT(*) FROM artist_genre", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ag_count, 3, "Expected 3 artist_genre rows (agents only)");
+
+        // `load_all` is idempotent with album/track works present.
+        load_all(&conn, dir.path()).unwrap();
+        let album_count2: usize = conn
+            .query_row("SELECT COUNT(*) FROM album", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            album_count2, album_count,
+            "Album count stable after re-load"
+        );
+        let track_count2: usize = conn
+            .query_row("SELECT COUNT(*) FROM track", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            track_count2, track_count,
+            "Track count stable after re-load"
+        );
+        let aa_count2: usize = conn
+            .query_row("SELECT COUNT(*) FROM album_artist", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            aa_count2, aa_count,
+            "album_artist count stable after re-load"
+        );
+        let talbum_count2: usize = conn
+            .query_row("SELECT COUNT(*) FROM track_album", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            talbum_count2, talbum_count,
+            "track_album count stable after re-load"
+        );
     }
 
     // -----------------------------------------------------------------------
