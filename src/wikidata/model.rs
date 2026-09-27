@@ -241,9 +241,7 @@ mod tests {
     use super::*;
 
     /// Helper: the target Q-ID of the first claim for a property, or `None`.
-    fn first_claim_value(
-        claims: Option<&Vec<Claim>>,
-    ) -> Option<String> {
+    fn first_claim_value(claims: Option<&Vec<Claim>>) -> Option<String> {
         match claims {
             Some(cs) if !cs.is_empty() => {
                 let dv = cs[0].mainsnak.as_ref().and_then(|m| m.datavalue.as_ref());
@@ -685,14 +683,22 @@ mod tests {
         // P2047 is a quantity datavalue: amount + unit are captured.
         let p2047 = entity.claims.get("P2047").expect("P2047 claim");
         assert_eq!(p2047.len(), 1);
-        let dv = p2047[0].mainsnak.as_ref().expect("mainsnak").datavalue.clone();
-        assert_eq!(dv, Some(DatavalueValue {
-            amount: Some("+240".into()),
-            unit: Some("http://www.wikidata.org/entity/Q11574".into()),
-            precision: None,
-            id: None,
-            time: None,
-        }));
+        let dv = p2047[0]
+            .mainsnak
+            .as_ref()
+            .expect("mainsnak")
+            .datavalue
+            .clone();
+        assert_eq!(
+            dv,
+            Some(DatavalueValue {
+                amount: Some("+240".into()),
+                unit: Some("http://www.wikidata.org/entity/Q11574".into()),
+                precision: None,
+                id: None,
+                time: None,
+            })
+        );
     }
 
     /// Load person agent with sitelinks fixture: the `enwiki` title falls
