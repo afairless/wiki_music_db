@@ -125,7 +125,7 @@ cargo run --release -- populate --dump /home/tr/wiki_db/latest-all.json.gz \
 
 Run the plan §7 DoD battery: role separation ≈0; "The Joshua Tree" in album; U2 album_artist non-empty; `track_album` ≥ 7,000; `duration_seconds` ≥ 100; `release_date` ≥ 1,000; QID-mirror names below 3,930; `update --dry-run` + upsert sanity; `cargo test && cargo clippy && cargo fmt --check`. Record the `inclusion_reason` distribution audit. On pass: `mv music.duckdb music-v1-inverted.duckdb && mv music-v2.duckdb music.duckdb` (or point `wiki_db.toml` at v2).
 
-## Plan table
+## Steps
 
 |#|Commit message|Logical unit|Key deliverables|Tests|
 |---|---|---|---|---|
