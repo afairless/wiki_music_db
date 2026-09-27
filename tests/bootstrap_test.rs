@@ -148,12 +148,14 @@ fn test_bootstrap_populates_all_tables() {
         "Expected 0 artist_member_of rows"
     );
 
-    // Albums from P175 (Q99902) → album with Q-ID stub name
-    assert_eq!(table_count(&conn, "album"), 1, "Expected 1 album");
+    // Agents no longer absorb P175 as "albums" (role-inversion fix):
+    // Q99902's P175 points at a performer and is dropped at extraction,
+    // so no album stubs or junctions are produced.
+    assert_eq!(table_count(&conn, "album"), 0, "Expected 0 albums");
     assert_eq!(
         table_count(&conn, "album_artist"),
-        1,
-        "Expected 1 album_artist row"
+        0,
+        "Expected 0 album_artist rows"
     );
 
     // Tracks: none in fixture (no P658 claims)

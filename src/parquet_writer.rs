@@ -297,12 +297,14 @@ mod tests {
             description: None,
             artist_type: "person".to_string(),
             inclusion_reason: "P106:Q639669".to_string(),
+            role: crate::wikidata::filter::EntityRole::Agent,
             birth_date: None,
             death_date: None,
             genres: genres.into_iter().map(String::from).collect(),
             instruments: vec![],
             member_of: vec![],
             albums: vec![],
+            parent_album: vec![],
             tracks: vec![],
         }
     }
@@ -403,12 +405,14 @@ mod tests {
             description: None,
             artist_type: "person".to_string(),
             inclusion_reason: "PROP:P136".to_string(),
+            role: crate::wikidata::filter::EntityRole::Agent,
             birth_date: None,
             death_date: None,
             genres: vec![],
             instruments: vec![],
             member_of: vec![],
             albums: vec![],
+            parent_album: vec![],
             tracks: vec![],
         };
         writer.write_batch(&[entity]).unwrap();
@@ -446,12 +450,14 @@ mod tests {
             description: None,
             artist_type: "person".to_string(),
             inclusion_reason: "P106:Q639669".to_string(),
+            role: crate::wikidata::filter::EntityRole::Agent,
             birth_date: NaiveDate::from_ymd_opt(1972, 3, 22),
             death_date: None,
             genres: vec![],
             instruments: vec![],
             member_of: vec![],
             albums: vec![],
+            parent_album: vec![],
             tracks: vec![],
         };
         writer.write_batch(&[entity]).unwrap();
@@ -509,7 +515,7 @@ mod tests {
 
     #[test]
     fn test_round_trip_with_album_refs() {
-        use crate::extraction::AlbumRef;
+        use crate::extraction::PerformerRef;
         let dir = tempfile::tempdir().unwrap();
         let mut writer = MusicEntityBatchWriter::new(dir.path())
             .unwrap()
@@ -520,15 +526,17 @@ mod tests {
             description: None,
             artist_type: "person".to_string(),
             inclusion_reason: "P106:Q639669".to_string(),
+            role: crate::wikidata::filter::EntityRole::Agent,
             birth_date: None,
             death_date: None,
             genres: vec![],
             instruments: vec![],
             member_of: vec![],
-            albums: vec![AlbumRef {
-                album_id: "Q123".into(),
+            albums: vec![PerformerRef {
+                qid: "Q123".into(),
                 role: Some("performer".into()),
             }],
+            parent_album: vec![],
             tracks: vec![],
         };
         writer.write_batch(&[entity]).unwrap();

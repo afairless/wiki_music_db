@@ -12,12 +12,16 @@
 //! - `birth_date`, `death_date`: None means either no date property or an unparseable
 //!   date string (logged at WARN with the raw value; stored as NULL)
 //! - `inclusion_reason`: why the entity passed the music filter
+//! - `role`: the classified entity role [`crate::wikidata::filter::EntityRole`] —
+//!   agent rows feed the artist tables, album/track works feed their own tables
+//!   and performer/parent junctions
 //! - All `Vec` fields default to empty (not None) — empty collections mean no data
 
 use std::collections::HashSet;
 
 use chrono::NaiveDate;
 
+use crate::wikidata::filter::EntityRole;
 use crate::wikidata::model::Entity;
 use crate::wikidata::stream::FilteredEntity;
 
@@ -38,6 +42,8 @@ pub struct MusicEntity {
     pub artist_type: String,
     /// Why the entity passed the music filter (e.g. "P106:Q639669").
     pub inclusion_reason: String,
+    /// The classified role (agent, album work, or track work).
+    pub role: EntityRole,
     /// Date of birth, or None (parsed from P569).
     pub birth_date: Option<NaiveDate>,
     /// Date of death, or None (parsed from P570).
@@ -48,27 +54,30 @@ pub struct MusicEntity {
     pub instruments: Vec<String>,
     /// Group Q-IDs the entity is a member of (P463).
     pub member_of: Vec<String>,
-    /// Album references (P175 — performer on an album).
-    pub albums: Vec<AlbumRef>,
-    /// Track references (P658 — performer on a track).
-    pub tracks: Vec<TrackRef>,
+    /// Performer references (P175). On album/track works these are the
+    /// featured performers, consumed for `album_artist`/`track_artist`
+    /// junctions; agents never absorb P175 as album refs (that was the
+    /// historical role inversion) so this is always empty for them.
+    pub albums: Vec<PerformerRef>,
+    /// Parent album Q-IDs (P361); populated for track works only.
+    pub parent_album: Vec<String>,
+    /// Transitional: always empty since the P658 (tracklist) extraction
+    /// path was removed. Kept so the artist-centric Parquet schema and its
+    /// loader stay stable; dropped when the writer gains role/parents columns.
+    pub tracks: Vec<PerformerRef>,
 }
 
-/// Reference to an album with an optional role.
+/// Reference to a performer with an optional role.
+///
+/// The `albums` JSON column carries these refs on work rows: a work's P175
+/// claims point *to* its featured performers, so the ref Q-ID is a performer
+/// (artist) ID, never a work ID — the old `album_id`/`track_id` field names
+/// lied about that and are gone.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct AlbumRef {
-    /// The album's Wikidata Q-ID.
-    pub album_id: String,
+pub struct PerformerRef {
+    /// The performer's Wikidata Q-ID.
+    pub qid: String,
     /// Optional role (e.g. "performer", "producer").
-    pub role: Option<String>,
-}
-
-/// Reference to a track with an optional role.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct TrackRef {
-    /// The track's Wikidata Q-ID.
-    pub track_id: String,
-    /// Optional role (e.g. "performer", "composer").
     pub role: Option<String>,
 }
 
@@ -146,8 +155,10 @@ pub fn extract_music_entity(
     let mut genres: Vec<String> = Vec::new();
     let mut instruments: Vec<String> = Vec::new();
     let mut member_of: Vec<String> = Vec::new();
-    let mut albums: Vec<AlbumRef> = Vec::new();
-    let mut tracks: Vec<TrackRef> = Vec::new();
+    let role = filtered.role;
+
+    let mut albums: Vec<PerformerRef> = Vec::new();
+    let mut parent_album: Vec<String> = Vec::new();
 
     for (prop_id, claims) in &entity.claims {
         match prop_id.as_str() {
@@ -164,7 +175,7 @@ pub fn extract_music_entity(
                 }
             }
             "P136" => {
-                // Genre
+                // Genre (works carry genres for genre-junction enrichment)
                 for qid in extract_qids(claims) {
                     genres.push(qid.clone());
                     genre_qids.insert(qid);
@@ -179,21 +190,22 @@ pub fn extract_music_entity(
                 member_of.extend(extract_qids(claims));
             }
             "P175" => {
-                // Performer (album reference)
-                for qid in extract_qids(claims) {
-                    albums.push(AlbumRef {
-                        album_id: qid,
-                        role: Some("performer".to_string()),
-                    });
+                // Featured performers (P175). Only works (album/track) get
+                // performer refs; agents must not absorb P175 as "albums" —
+                // that was the historical role inversion.
+                if role != EntityRole::Agent {
+                    for qid in extract_qids(claims) {
+                        albums.push(PerformerRef {
+                            qid,
+                            role: Some("performer".to_string()),
+                        });
+                    }
                 }
             }
-            "P658" => {
-                // Track (performer on a track)
-                for qid in extract_qids(claims) {
-                    tracks.push(TrackRef {
-                        track_id: qid,
-                        role: Some("performer".to_string()),
-                    });
+            "P361" => {
+                // Parent album (P361) — track works only.
+                if role == EntityRole::Track {
+                    parent_album.extend(extract_qids(claims));
                 }
             }
             _ => {
@@ -208,13 +220,15 @@ pub fn extract_music_entity(
         description,
         artist_type,
         inclusion_reason: inclusion_reason.clone(),
+        role,
         birth_date,
         death_date,
         genres,
         instruments,
         member_of,
         albums,
-        tracks,
+        parent_album,
+        tracks: Vec::new(),
     })
 }
 
@@ -451,6 +465,7 @@ mod tests {
         descriptions: Option<HashMap<String, LanguageValue>>,
         claims: HashMap<String, Vec<Claim>>,
         inclusion_reason: &str,
+        role: crate::wikidata::filter::EntityRole,
     ) -> FilteredEntity {
         FilteredEntity {
             entity: Entity {
@@ -462,9 +477,7 @@ mod tests {
                 claims,
             },
             inclusion_reason: inclusion_reason.into(),
-            // Extraction tests exercise agent-shaped entities; role-aware
-            // fixtures arrive with the extraction step.
-            role: crate::wikidata::filter::EntityRole::Agent,
+            role,
         }
     }
 
@@ -540,6 +553,7 @@ mod tests {
             Some(en_description("American singer-songwriter and musician")),
             claims,
             "P106:Q639669",
+            crate::wikidata::filter::EntityRole::Agent,
         );
 
         let mut genre_qids = HashSet::new();
@@ -549,13 +563,14 @@ mod tests {
         assert_eq!(me.name, Some("Ivy Queen".to_string()));
         assert_eq!(me.artist_type, "person");
         assert_eq!(me.inclusion_reason, "P106:Q639669");
+        assert_eq!(me.role, crate::wikidata::filter::EntityRole::Agent);
         assert_eq!(me.birth_date, NaiveDate::from_ymd_opt(1972, 3, 22));
         assert!(me.death_date.is_none());
         assert_eq!(me.genres, vec!["Q35718"]);
         assert!(me.instruments.is_empty());
         assert!(me.member_of.is_empty());
         assert!(me.albums.is_empty());
-        assert!(me.tracks.is_empty());
+        assert!(me.parent_album.is_empty());
 
         // Genre Q-ID should be collected
         assert!(genre_qids.contains("Q35718"));
@@ -573,6 +588,7 @@ mod tests {
             Some(en_description("English rock band")),
             claims,
             "P31:Q215380",
+            crate::wikidata::filter::EntityRole::Agent,
         );
 
         let mut genre_qids = HashSet::new();
@@ -582,6 +598,7 @@ mod tests {
         assert_eq!(me.name, Some("The Beatles".to_string()));
         assert_eq!(me.artist_type, "group");
         assert_eq!(me.inclusion_reason, "P31:Q215380");
+        assert_eq!(me.role, crate::wikidata::filter::EntityRole::Agent);
         assert!(me.birth_date.is_none());
         assert!(me.death_date.is_none());
         assert_eq!(me.genres, vec!["Q57251"]);
@@ -596,6 +613,7 @@ mod tests {
             None,
             HashMap::new(),
             "PROP:P136",
+            crate::wikidata::filter::EntityRole::Agent,
         );
 
         let mut genre_qids = HashSet::new();
@@ -613,6 +631,7 @@ mod tests {
             None,
             HashMap::new(),
             "PROP:P136",
+            crate::wikidata::filter::EntityRole::Agent,
         );
 
         let mut genre_qids = HashSet::new();
@@ -631,7 +650,14 @@ mod tests {
             vec![make_claim_with_time("+1985-06-21T00:00:00Z")],
         );
 
-        let fe = filtered_entity("Q123", Some(en_label("Test")), None, claims, "P106:Q639669");
+        let fe = filtered_entity(
+            "Q123",
+            Some(en_label("Test")),
+            None,
+            claims,
+            "P106:Q639669",
+            crate::wikidata::filter::EntityRole::Agent,
+        );
         let mut genre_qids = HashSet::new();
         let me = extract_music_entity(&fe, &mut genre_qids).expect("extract with birth date");
 
@@ -647,7 +673,14 @@ mod tests {
             vec![make_claim_with_time("not-a-valid-date")],
         );
 
-        let fe = filtered_entity("Q123", Some(en_label("Test")), None, claims, "P106:Q639669");
+        let fe = filtered_entity(
+            "Q123",
+            Some(en_label("Test")),
+            None,
+            claims,
+            "P106:Q639669",
+            crate::wikidata::filter::EntityRole::Agent,
+        );
         let mut genre_qids = HashSet::new();
         let me = extract_music_entity(&fe, &mut genre_qids).expect("extract with invalid date");
 
@@ -663,6 +696,7 @@ mod tests {
             None,
             HashMap::new(),
             "P106:Q639669",
+            crate::wikidata::filter::EntityRole::Agent,
         );
 
         let mut genre_qids = HashSet::new();
@@ -680,7 +714,14 @@ mod tests {
             vec![make_claim_with_id("Q35718"), make_claim_with_id("Q57251")],
         );
 
-        let fe = filtered_entity("Q123", Some(en_label("Test")), None, claims, "PROP:P136");
+        let fe = filtered_entity(
+            "Q123",
+            Some(en_label("Test")),
+            None,
+            claims,
+            "PROP:P136",
+            crate::wikidata::filter::EntityRole::Agent,
+        );
         let mut genre_qids = HashSet::new();
         let me = extract_music_entity(&fe, &mut genre_qids).expect("extract multiple genres");
 
@@ -696,7 +737,14 @@ mod tests {
         let mut claims: HashMap<String, Vec<Claim>> = HashMap::new();
         claims.insert("P1303".into(), vec![make_claim_with_id("Q171")]);
 
-        let fe = filtered_entity("Q123", Some(en_label("Test")), None, claims, "PROP:P1303");
+        let fe = filtered_entity(
+            "Q123",
+            Some(en_label("Test")),
+            None,
+            claims,
+            "PROP:P1303",
+            crate::wikidata::filter::EntityRole::Agent,
+        );
         let mut genre_qids = HashSet::new();
         let me = extract_music_entity(&fe, &mut genre_qids).expect("extract instruments");
 
@@ -708,7 +756,14 @@ mod tests {
         let mut claims: HashMap<String, Vec<Claim>> = HashMap::new();
         claims.insert("P463".into(), vec![make_claim_with_id("Q11649")]);
 
-        let fe = filtered_entity("Q123", Some(en_label("Test")), None, claims, "P106:Q639669");
+        let fe = filtered_entity(
+            "Q123",
+            Some(en_label("Test")),
+            None,
+            claims,
+            "P106:Q639669",
+            crate::wikidata::filter::EntityRole::Agent,
+        );
         let mut genre_qids = HashSet::new();
         let me = extract_music_entity(&fe, &mut genre_qids).expect("extract member_of");
 
@@ -716,36 +771,94 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_albums() {
+    fn test_extract_agent_ignores_p175() {
         let mut claims: HashMap<String, Vec<Claim>> = HashMap::new();
         claims.insert("P175".into(), vec![make_claim_with_id("Q12345")]);
 
-        let fe = filtered_entity("Q123", Some(en_label("Test")), None, claims, "P106:Q639669");
+        let fe = filtered_entity(
+            "Q123",
+            Some(en_label("Test")),
+            None,
+            claims,
+            "P106:Q639669",
+            crate::wikidata::filter::EntityRole::Agent,
+        );
         let mut genre_qids = HashSet::new();
-        let me = extract_music_entity(&fe, &mut genre_qids).expect("extract albums");
+        let me = extract_music_entity(&fe, &mut genre_qids).expect("extract agent with P175");
 
-        assert_eq!(me.albums.len(), 1);
-        assert_eq!(me.albums[0].album_id, "Q12345");
-        assert_eq!(me.albums[0].role, Some("performer".to_string()));
+        // Agents must not absorb P175 as album refs — that was the
+        // historical role inversion (performer Q-IDs landing in `album`).
+        assert_eq!(me.role, crate::wikidata::filter::EntityRole::Agent);
+        assert!(me.albums.is_empty());
+        assert!(me.parent_album.is_empty());
     }
 
     #[test]
-    fn test_extract_tracks() {
+    fn test_extract_album_work_performers() {
         let mut claims: HashMap<String, Vec<Claim>> = HashMap::new();
-        claims.insert("P658".into(), vec![make_claim_with_id("Q54321")]);
+        claims.insert("P31".into(), vec![make_claim_with_id("Q482994")]); // album
+        claims.insert("P175".into(), vec![make_claim_with_id("Q396")]); // performer: U2
+        claims.insert("P361".into(), vec![make_claim_with_id("Q152873")]); // decoy parent
 
-        let fe = filtered_entity("Q123", Some(en_label("Test")), None, claims, "P106:Q639669");
+        let fe = filtered_entity(
+            "Q152873",
+            Some(en_label("The Joshua Tree")),
+            None,
+            claims,
+            "P31:Q482994",
+            crate::wikidata::filter::EntityRole::Album,
+        );
         let mut genre_qids = HashSet::new();
-        let me = extract_music_entity(&fe, &mut genre_qids).expect("extract tracks");
+        let me = extract_music_entity(&fe, &mut genre_qids).expect("extract album work");
 
-        assert_eq!(me.tracks.len(), 1);
-        assert_eq!(me.tracks[0].track_id, "Q54321");
-        assert_eq!(me.tracks[0].role, Some("performer".to_string()));
+        assert_eq!(me.role, crate::wikidata::filter::EntityRole::Album);
+        // P175 on a work names its featured performers — never inverted refs.
+        assert_eq!(me.albums.len(), 1);
+        assert_eq!(me.albums[0].qid, "Q396");
+        assert_eq!(me.albums[0].role, Some("performer".to_string()));
+        // P361 is a parent-album concept on tracks only; album works ignore it.
+        assert!(me.parent_album.is_empty());
+    }
+
+    #[test]
+    fn test_extract_track_work_performers_and_parents() {
+        let mut claims: HashMap<String, Vec<Claim>> = HashMap::new();
+        claims.insert("P31".into(), vec![make_claim_with_id("Q7366")]); // song
+        claims.insert("P175".into(), vec![make_claim_with_id("Q396")]); // performer: U2
+        claims.insert("P361".into(), vec![make_claim_with_id("Q152873")]); // parent album
+
+        let fe = filtered_entity(
+            "Q6649",
+            Some(en_label("With or Without You")),
+            None,
+            claims,
+            "P31:Q7366",
+            crate::wikidata::filter::EntityRole::Track,
+        );
+        let mut genre_qids = HashSet::new();
+        let me = extract_music_entity(&fe, &mut genre_qids).expect("extract track work");
+
+        assert_eq!(me.role, crate::wikidata::filter::EntityRole::Track);
+        // P175 names the featured performers; P361 the parent albums —
+        // performer/parent refs, never inverted work refs.
+        assert_eq!(me.albums.len(), 1);
+        assert_eq!(me.albums[0].qid, "Q396");
+        assert_eq!(me.albums[0].role, Some("performer".to_string()));
+        assert_eq!(me.parent_album, vec!["Q152873"]);
+        // The P658 tracklist path is deleted: no track refs are emitted.
+        assert!(me.tracks.is_empty());
     }
 
     #[test]
     fn test_extract_empty_id_rejected() {
-        let fe = filtered_entity("", None, None, HashMap::new(), "PROP:P136");
+        let fe = filtered_entity(
+            "",
+            None,
+            None,
+            HashMap::new(),
+            "PROP:P136",
+            crate::wikidata::filter::EntityRole::Agent,
+        );
         let mut genre_qids = HashSet::new();
         let result = extract_music_entity(&fe, &mut genre_qids);
 
@@ -768,12 +881,14 @@ mod tests {
             description: None,
             artist_type: "person".into(),
             inclusion_reason: "test".into(),
+            role: crate::wikidata::filter::EntityRole::Agent,
             birth_date: None,
             death_date: None,
             genres: vec!["Q35718".into(), "Q57251".into()],
             instruments: vec![],
             member_of: vec![],
             albums: vec![],
+            parent_album: vec![],
             tracks: vec![],
         };
 
@@ -881,12 +996,14 @@ mod tests {
             description: None,
             artist_type: "person".into(),
             inclusion_reason: "test".into(),
+            role: crate::wikidata::filter::EntityRole::Agent,
             birth_date: None,
             death_date: None,
             genres: vec![],
             instruments: vec![],
             member_of: vec![],
             albums: vec![],
+            parent_album: vec![],
             tracks: vec![],
         }
     }

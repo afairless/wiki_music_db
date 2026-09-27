@@ -884,23 +884,18 @@ fn upsert_entity_inner(conn: &Connection, entity: &MusicEntity) -> Result<()> {
         conn.execute(
             "INSERT OR REPLACE INTO album (id, name) \
              VALUES (?1, COALESCE((SELECT label FROM qid_label WHERE qid = ?1), ?1))",
-            duckdb::params![album_ref.album_id],
+            duckdb::params![album_ref.qid],
         )
-        .with_context(|| {
-            format!(
-                "Failed to upsert album {} for {}",
-                album_ref.album_id, entity.id
-            )
-        })?;
+        .with_context(|| format!("Failed to upsert album {} for {}", album_ref.qid, entity.id))?;
 
         conn.execute(
             "INSERT OR IGNORE INTO album_artist (album_id, artist_id, role) VALUES (?1, ?2, ?3)",
-            duckdb::params![album_ref.album_id, entity.id, album_ref.role],
+            duckdb::params![album_ref.qid, entity.id, album_ref.role],
         )
         .with_context(|| {
             format!(
                 "Failed to upsert album_artist {} for {}",
-                album_ref.album_id, entity.id
+                album_ref.qid, entity.id
             )
         })?;
     }
@@ -910,23 +905,18 @@ fn upsert_entity_inner(conn: &Connection, entity: &MusicEntity) -> Result<()> {
         conn.execute(
             "INSERT OR REPLACE INTO track (id, name) \
              VALUES (?1, COALESCE((SELECT label FROM qid_label WHERE qid = ?1), ?1))",
-            duckdb::params![track_ref.track_id],
+            duckdb::params![track_ref.qid],
         )
-        .with_context(|| {
-            format!(
-                "Failed to upsert track {} for {}",
-                track_ref.track_id, entity.id
-            )
-        })?;
+        .with_context(|| format!("Failed to upsert track {} for {}", track_ref.qid, entity.id))?;
 
         conn.execute(
             "INSERT OR IGNORE INTO track_artist (track_id, artist_id, role) VALUES (?1, ?2, ?3)",
-            duckdb::params![track_ref.track_id, entity.id, track_ref.role],
+            duckdb::params![track_ref.qid, entity.id, track_ref.role],
         )
         .with_context(|| {
             format!(
                 "Failed to upsert track_artist {} for {}",
-                track_ref.track_id, entity.id
+                track_ref.qid, entity.id
             )
         })?;
     }
@@ -1781,12 +1771,14 @@ mod tests {
             description: None,
             artist_type: "person".to_string(),
             inclusion_reason: "P106:Q639669".to_string(),
+            role: crate::wikidata::filter::EntityRole::Agent,
             birth_date: None,
             death_date: None,
             genres: genres.into_iter().map(|s| s.to_string()).collect(),
             instruments: vec![],
             member_of: vec![],
             albums: vec![],
+            parent_album: vec![],
             tracks: vec![],
         }
     }
@@ -2043,12 +2035,14 @@ mod tests {
             description: Some("A test description".to_string()),
             artist_type: "person".to_string(),
             inclusion_reason: "P106:Q639669".to_string(),
+            role: crate::wikidata::filter::EntityRole::Agent,
             birth_date: None,
             death_date: None,
             genres: vec![],
             instruments: vec![],
             member_of: vec![],
             albums: vec![],
+            parent_album: vec![],
             tracks: vec![],
         };
 
@@ -2077,12 +2071,14 @@ mod tests {
             description: None,
             artist_type: "person".to_string(),
             inclusion_reason: "P106:Q639669".to_string(),
+            role: crate::wikidata::filter::EntityRole::Agent,
             birth_date: None,
             death_date: None,
             genres: vec![],
             instruments: vec![],
             member_of: vec![],
             albums: vec![],
+            parent_album: vec![],
             tracks: vec![],
         };
 
@@ -2118,15 +2114,17 @@ mod tests {
             description: None,
             artist_type: "person".to_string(),
             inclusion_reason: "P106:Q639669".to_string(),
+            role: crate::wikidata::filter::EntityRole::Agent,
             birth_date: None,
             death_date: None,
             genres: vec![],
             instruments: vec![],
             member_of: vec![],
-            albums: vec![crate::extraction::AlbumRef {
-                album_id: "Q55555".to_string(),
+            albums: vec![crate::extraction::PerformerRef {
+                qid: "Q55555".to_string(),
                 role: Some("performer".to_string()),
             }],
+            parent_album: vec![],
             tracks: vec![],
         };
 
@@ -2161,14 +2159,16 @@ mod tests {
             description: None,
             artist_type: "person".to_string(),
             inclusion_reason: "P106:Q639669".to_string(),
+            role: crate::wikidata::filter::EntityRole::Agent,
             birth_date: None,
             death_date: None,
             genres: vec![],
             instruments: vec![],
             member_of: vec![],
             albums: vec![],
-            tracks: vec![crate::extraction::TrackRef {
-                track_id: "Q66666".to_string(),
+            parent_album: vec![],
+            tracks: vec![crate::extraction::PerformerRef {
+                qid: "Q66666".to_string(),
                 role: Some("performer".to_string()),
             }],
         };
@@ -2197,17 +2197,19 @@ mod tests {
             description: None,
             artist_type: "person".to_string(),
             inclusion_reason: "P106:Q639669".to_string(),
+            role: crate::wikidata::filter::EntityRole::Agent,
             birth_date: None,
             death_date: None,
             genres: vec![],
             instruments: vec![],
             member_of: vec![],
-            albums: vec![crate::extraction::AlbumRef {
-                album_id: "Q55555".to_string(),
+            albums: vec![crate::extraction::PerformerRef {
+                qid: "Q55555".to_string(),
                 role: Some("performer".to_string()),
             }],
-            tracks: vec![crate::extraction::TrackRef {
-                track_id: "Q66666".to_string(),
+            parent_album: vec![],
+            tracks: vec![crate::extraction::PerformerRef {
+                qid: "Q66666".to_string(),
                 role: Some("performer".to_string()),
             }],
         };

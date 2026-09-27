@@ -40,12 +40,14 @@ fn make_test_entity(id: &str, name: Option<&str>, genres: Vec<&str>) -> MusicEnt
         description: None,
         artist_type: "person".to_string(),
         inclusion_reason: "P106:Q639669".to_string(),
+        role: wiki_db::wikidata::filter::EntityRole::Agent,
         birth_date: None,
         death_date: None,
         genres: genres.into_iter().map(|s| s.to_string()).collect(),
         instruments: vec![],
         member_of: vec![],
         albums: vec![],
+        parent_album: vec![],
         tracks: vec![],
     }
 }
