@@ -9,7 +9,8 @@
 //!
 //! ## Data contract (ingestion → output boundary)
 //!
-//! - **Labels**: non-empty UTF-8 strings; empty labels stored as NULL
+//! - **Labels**: non-empty UTF-8 strings; empty labels stored as NULL.
+//!   Source precedence: `en` label → sanitized `enwiki` sitelink title → NULL
 //! - **Dates (P577)**: Wikidata full-precision dates parse normally; year-only
 //!   dates (precision 9) produce YYYY-01-01; coarser precisions (8, 7, 6)
 //!   produce NULL; unparseable dates produce NULL
@@ -372,15 +373,25 @@ fn passes_precheck(line: &str, ac: &AhoCorasick, discovered_qids: &HashSet<Strin
 
 /// Extract the English label and description from a Wikidata entity.
 ///
-/// Returns `(label, description)` where both are `None` if no English
-/// values exist. Empty labels are stored as NULL.
+/// Label source precedence (name-resolution contract §4 #2): the `en` label
+/// wins; otherwise a sanitized `enwiki` sitelink title is used as a fallback;
+/// otherwise `None`. Empty labels are stored as NULL. The sitelink fallback
+/// backfills entities that have a Wikipedia article but no English label in
+/// the dump.
 fn extract_label(entity: &Entity) -> (Option<String>, Option<String>) {
     let label = entity
         .labels
         .as_ref()
         .and_then(|l| l.en())
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+        .map(|s| s.to_string())
+        .or_else(|| {
+            entity
+                .sitelinks
+                .as_ref()
+                .and_then(|links| links.get("enwiki").map(|sl| sl.title.as_str()))
+                .and_then(sanitize_sitelink_title)
+        });
 
     let description = entity
         .descriptions
@@ -389,6 +400,23 @@ fn extract_label(entity: &Entity) -> (Option<String>, Option<String>) {
         .map(|s| s.to_string());
 
     (label, description)
+}
+
+/// Sanitize a sitelink title for use as a label.
+///
+/// Replaces underscores with spaces (`The_Joshua_Tree` → `The Joshua Tree`),
+/// trims surrounding whitespace, and **keeps** `(album)`/`(song)`-style
+/// disambiguators (name-resolution contract §4 #2 — decided: do not strip).
+/// Returns `None` when the title is empty or whitespace-only after
+/// sanitization (e.g. an underscore-only title).
+fn sanitize_sitelink_title(title: &str) -> Option<String> {
+    let spaced = title.replace("_", " ");
+    let sanitized = spaced.trim();
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized.to_string())
+    }
 }
 
 /// Extract claims for album enrichment from a Wikidata entity.
@@ -738,7 +766,7 @@ fn write_enrichment_parquet(rows: &[EnrichmentRow], path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::wikidata::model::{
-        Claim, DatavalueValue, Descriptions, Entity, Labels, LanguageValue, Mainsnak,
+        Claim, DatavalueValue, Descriptions, Entity, Labels, LanguageValue, Mainsnak, Sitelink,
     };
     use proptest::prop_assert_eq;
     use std::collections::HashMap;
@@ -810,6 +838,103 @@ mod tests {
         let (label, desc) = extract_label(&entity);
         assert_eq!(label, None, "Empty English label should be NULL");
         assert_eq!(desc, None);
+    }
+
+    /// Helper: entity with no labels/descriptions but with an `enwiki` sitelink.
+    fn make_entity_with_sitelink(en_title: &str) -> Entity {
+        Entity {
+            sitelinks: Some({
+                let mut m = HashMap::new();
+                m.insert(
+                    "enwiki".into(),
+                    Sitelink {
+                        title: en_title.into(),
+                    },
+                );
+                m
+            }),
+            id: "Q152873".to_string(),
+            entity_type: "item".to_string(),
+            labels: None,
+            descriptions: None,
+            claims: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_extract_label_sitelink_fallback() {
+        // No English label → the sanitized enwiki title fills the label slot.
+        let entity = make_entity_with_sitelink("The_Joshua_Tree");
+        let (label, desc) = extract_label(&entity);
+        assert_eq!(label, Some("The Joshua Tree".to_string()));
+        assert_eq!(desc, None);
+    }
+
+    #[test]
+    fn test_extract_label_en_wins_over_sitelink() {
+        // The `en` label always wins over the sitelink fallback, even when the
+        // sitelink title differs.
+        let entity = Entity {
+            sitelinks: Some({
+                let mut m = HashMap::new();
+                m.insert(
+                    "enwiki".into(),
+                    Sitelink {
+                        title: "Ivy_Queen_(Puerto_Rican_singer)".into(),
+                    },
+                );
+                m
+            }),
+            id: "Q2831".to_string(),
+            entity_type: "item".to_string(),
+            labels: Some(Labels({
+                let mut m = HashMap::new();
+                m.insert(
+                    "en".into(),
+                    LanguageValue {
+                        value: "Ivy Queen".into(),
+                    },
+                );
+                m
+            })),
+            descriptions: None,
+            claims: HashMap::new(),
+        };
+        let (label, _) = extract_label(&entity);
+        assert_eq!(label, Some("Ivy Queen".to_string()));
+    }
+
+    #[test]
+    fn test_extract_label_underscore_only_sitelink() {
+        // An underscore-only sitelink title sanitizes to empty → NULL.
+        let entity = make_entity_with_sitelink("___");
+        let (label, _) = extract_label(&entity);
+        assert_eq!(label, None);
+    }
+
+    #[test]
+    fn test_sanitize_sitelink_title_replaces_underscores() {
+        assert_eq!(
+            sanitize_sitelink_title("The_Joshua_Tree"),
+            Some("The Joshua Tree".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sanitize_sitelink_title_keeps_disambiguator() {
+        // (album)/(song)-style disambiguators are kept, per contract §4 #2.
+        assert_eq!(
+            sanitize_sitelink_title("The_Joshua_Tree_(album)"),
+            Some("The Joshua Tree (album)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sanitize_sitelink_title_empty_is_none() {
+        // Empty, whitespace-only, and underscore-only titles yield NULL.
+        assert_eq!(sanitize_sitelink_title(""), None);
+        assert_eq!(sanitize_sitelink_title("  "), None);
+        assert_eq!(sanitize_sitelink_title("____"), None);
     }
 
     // -------------------------------------------------------------------
