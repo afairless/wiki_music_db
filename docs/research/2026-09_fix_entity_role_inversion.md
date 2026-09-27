@@ -1,7 +1,10 @@
 # Research: Fix Album/Track Entity-Role Inversion and Finish Enrichment Coverage
 
 **Date:** 2026-09
-**Status:** Plan
+**Status:** Implemented
+**Implemented:** 2026-09 — closes with commits `45f892d` (model: amount/unit + sitelinks), `a599281` (filter: role classifier), `ddc5363` (extraction: performers/parents), `5d1ca0f` (parquet: role/parents columns), `ee86c07` (loader: bootstrap role routing), `41a0bac` (loader: update-path role routing), `27b0309` (label_extractor: P2047 durations), `34cd953` (label_extractor: sitelink fallback), `800f7b4` (query: corrected-role searches), `8895109` (test: work-entity fixtures) — see git log. The Step 10 real-dump verification battery is recorded in the TODO step 12 run notes.
+
+*Status updated per the [documentation conventions in AGENTS.md](../../AGENTS.md) — implemented plans carry `Status: Implemented` with their closing commits.*
 **References:**
 
 - [ARCHITECTURE.md](../ARCHITECTURE.md) — schema, pipeline, filtering strategy, decision log

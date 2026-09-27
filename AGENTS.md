@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Builds a local, single-user DuckDB database of musical acts and artists from the Wikidata JSON dump. Streams, filters, and normalizes ~35 GB of gzipped Wikidata entities into a relational schema, then exposes CLI queries over the result.
+Builds a local, single-user DuckDB database of musical acts and artists from the Wikidata JSON dump. Streams, filters, and normalizes ~145 GB of gzipped Wikidata entities (weekly dump, 2026-09) into a relational schema, then exposes CLI queries over the result.
 
 ## Stack
 
@@ -112,6 +112,7 @@ scripts/
 - Phase 8: Polish & distribution (--verbose/--quiet, shell completions, CI pipeline, documentation)
 - Phase 9: Populate & name resolution — Q-ID label/claim extraction, `populate` subcommand, FK-safe backfill (2026-08)
 - Phase 10: FK-safety hardening — enrichment FK guards, FK-safe backfill with temp-table swap (2026-08)
+- Phase 11: Entity-role inversion fix & enrichment completion — role classifier (agent/album/track), role-aware extraction/parquet/loader, P2047 duration from datavalue amount, enwiki-sitelink label fallback, fresh `music-v2.duckdb` build (2026-09)
 
 The schema is at **v2 with 16 tables** (`schema_version`, `artist`, `genre`, `artist_genre`, `album`, `album_artist`, `album_genre`, `track`, `track_album`, `track_artist`, `artist_instrument`, `artist_member_of`, `sync_state`, `qid_label`, `instrument`, `record_label`).
 
@@ -125,7 +126,7 @@ The schema is at **v2 with 16 tables** (`schema_version`, `artist`, `genre`, `ar
 
 - When a research doc's plan is implemented, update its `Status:` header to `Implemented` (with closing commit references) in the same commit series that closes the plan.
 - Doc-update steps (README, ARCHITECTURE, AGENTS) are mandatory plan steps, not optional follow-ups.
-- Documentation is instance-agnostic: describe pipeline stage semantics — bootstrap seeds Q-ID placeholders, `populate` resolves them, `query` surfaces them — never the state of a particular database file or path. A reader must be able to (a) build a database from scratch following the docs, or (b) understand how an existing database was created.
+- Documentation is instance-agnostic: describe pipeline stage semantics — bootstrap classifies each entity into exactly one role (agent/album/track), `populate` resolves label-less residuals via the en-label → enwiki-sitelink fallback and fills enrichment, `query` surfaces them — never the state of a particular database file or path. A reader must be able to (a) build a database from scratch following the docs, or (b) understand how an existing database was created.
 
 Other documents (e.g., research docs) reference this subsection instead of restating the convention.
 

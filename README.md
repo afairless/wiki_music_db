@@ -4,16 +4,16 @@
 
 Build a fast, offline, queryable music database from the Wikidata entity dump.
 
-Streams the ~35 GB gzipped Wikidata JSON dump, filters to musical acts & artists, normalizes into a relational schema, and stores the result in an embedded DuckDB database — all from a single statically-compiled Rust binary.
+Streams the ~145 GB gzipped Wikidata JSON dump, filters to musical acts, albums, and tracks, normalizes into a relational schema, and stores the result in an embedded DuckDB database — all from a single statically-compiled Rust binary.
 
 ## Features
 
 - **Streaming ingestion**: Line-by-line gzip decompression — memory usage stays bounded regardless of dump size
-- **Smart filtering**: Multi-criteria music entity detection (occupation, group type, catch-all properties)
+- **Smart filtering**: Role classifier detects music entities and routes them into one of three roles (agent / album / track) via occupation, group type, work class, and catch-all properties
 - **Normalized schema**: 16-table relational database with artists, genres, albums, tracks, instruments, group membership, and Q-ID label lookups
 - **Full-text search**: DuckDB `fts` extension powers fast, unified search across artists, albums, genres, and tracks
 - **Incremental updates**: `update` merges entities changed since the last sync via the Wikidata SPARQL endpoint and Wikimedia REST API
-- **Name resolution**: `populate` resolves Q-ID name placeholders and fills in release dates, record labels, and track durations
+- **Name resolution**: `populate` resolves remaining Q-ID name placeholders (en label → enwiki sitelink fallback) and fills in release dates, record labels, and track durations
 - **Resumable**: `--resume` flag skips already-written intermediate files for interrupted runs
 - **Idempotent**: `INSERT OR IGNORE` throughout — re-running produces identical database state
 - **Intermediate Parquet**: Filtered data is written to columnar Parquet files before database loading, enabling independent testing and resumability
@@ -24,7 +24,7 @@ Streams the ~35 GB gzipped Wikidata JSON dump, filters to musical acts & artists
 ### Prerequisites
 
 - Rust toolchain (stable, edition 2024)
-- ~50 GB free disk space (35 GB dump + ~5 GB Parquet + ~1-2 GB DuckDB)
+- ~155 GB free disk space (145 GB dump + ~5 GB Parquet + ~1-2 GB DuckDB)
 
 ### Installation
 
@@ -36,11 +36,11 @@ cargo build --release
 
 ### Pipeline
 
-> **Note**: Running a full bootstrap takes 30-60 minutes and requires ~50 GB of
+> **Note**: Running a full bootstrap takes 30-60 minutes and requires ~155 GB of
 > free disk space.  The next three commands are all you need for a complete build:
 > download, bootstrap, and populate.
 
-**Step 1 — Download** the Wikidata dump (resumable, ~35 GB):
+**Step 1 — Download** the Wikidata dump (resumable, ~145 GB):
 
 ```bash
 cargo run -- download
@@ -53,9 +53,11 @@ cargo run --release -- bootstrap
 ```
 
 **Step 3 — Resolve names** (optional but recommended).  After bootstrap,
-`album.name` and `track.name` are Q-ID placeholders (e.g., `Q1636124`) and
-`release_date`, `record_label`, and `duration_seconds` are NULL.  `populate`
-re-scans the dump and replaces the placeholders with real English labels:
+entities whose labels are present in the dump already carry real names;
+entities without an English label keep a Q-ID placeholder (e.g., `Q1636124`)
+and `release_date`, `record_label`, and `duration_seconds` may be NULL.
+`populate` re-scans the dump, resolves the remaining placeholders
+(en label, with an `enwiki` sitelink-title fallback), and fills enrichment:
 
 ```bash
 cargo run --release -- populate
@@ -208,11 +210,13 @@ cargo run --release -- bootstrap --resume
 cargo run --release -- populate
 ```
 
-After bootstrap, `album.name` and `track.name` hold Q-ID placeholders (e.g.,
-`Q1636124`) and `release_date`, `record_label`, and `duration_seconds` are NULL.
-`populate` re-scans the dump, resolves real English labels, and fills in those
-columns.  It can be skipped if you only care about artists, or if names are
-already resolved (re-runs exit with a message and change nothing).
+After bootstrap, entities whose labels are present in the dump already carry
+real names; label-less entities keep Q-ID placeholders (e.g., `Q1636124`) and
+`release_date`, `record_label`, and `duration_seconds` may be NULL.  `populate`
+re-scans the dump, resolves the remaining placeholders (en label, with an
+`enwiki` sitelink-title fallback), and fills in those columns.  It can be
+skipped if you only care about artists, or if names are already resolved
+(re-runs exit with a message and change nothing).
 
 ```bash
 # Re-run populate against a different database or dump
@@ -301,7 +305,9 @@ Options:
 Requires a `bootstrap`ed database at schema v2 (16 tables).  Re-scans the dump
 (~tens of minutes) to extract labels and enrichment claims, then backfills
 `album.name`, `track.name`, `release_date`, `record_label`, and
-`duration_seconds`.  Skips with a message when all names are already resolved.
+`duration_seconds`.  Names use the en-label → enwiki-sitelink fallback;
+`duration_seconds` accepts only P2047 amounts whose unit is seconds (Q11574),
+otherwise NULL.  Skips with a message when all names are already resolved.
 
 ### `update` — Incrementally update the database
 
@@ -366,6 +372,13 @@ These flags are available on every subcommand:
 Log level precedence: `RUST_LOG` env var > `--verbose`/`--quiet` > config file > `info` (default).
 
 ## Database Schema
+
+Each filtered entity is classified into exactly one role (see
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — Filtering Strategy):
+
+- **agent** (people and groups) → `artist` and its join tables
+- **album** (albums, EPs, singles, compilations, …) → `album`, `album_artist`, `album_genre`
+- **track** (songs, instrumentals, …) → `track`, `track_artist`, `track_album`
 
 ```
 artist               — Core entity: person (musician) or group (band)
@@ -458,8 +471,8 @@ scripts/           — Helper scripts (dump downloader)
 
 ## Limitations
 
-- **English-only**: Artists without English labels get NULL names (stored, not rejected)
-- **Album/track names**: Stored as Q-ID placeholders until `populate` is run; `release_date`, `record_label`, and `duration_seconds` are NULL until then
+- **Label fallback**: Names resolve as English label → sanitized `enwiki` sitelink title → NULL; entities with neither get NULL names (stored, not rejected)
+- **Album/track names**: Only label-less entities keep Q-ID placeholders after bootstrap; `release_date`, `record_label`, and `duration_seconds` are NULL until `populate` runs
 - **Resume v1**: `--resume` restarts streaming from the beginning; only Parquet files are skipped
 
 ## License
