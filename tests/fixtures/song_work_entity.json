@@ -1,0 +1,65 @@
+{
+  "id": "Q155849",
+  "type": "item",
+  "labels": {
+    "en": {
+      "value": "With or Without You"
+    }
+  },
+  "descriptions": {
+    "en": {
+      "value": "1987 song by U2"
+    }
+  },
+  "claims": {
+    "P31": [
+      {
+        "mainsnak": {
+          "snaktype": "value",
+          "datavalue": {
+            "value": {
+              "id": "Q7366"
+            }
+          }
+        }
+      }
+    ],
+    "P361": [
+      {
+        "mainsnak": {
+          "snaktype": "value",
+          "datavalue": {
+            "value": {
+              "id": "Q152873"
+            }
+          }
+        }
+      }
+    ],
+    "P175": [
+      {
+        "mainsnak": {
+          "snaktype": "value",
+          "datavalue": {
+            "value": {
+              "id": "Q396"
+            }
+          }
+        }
+      }
+    ],
+    "P2047": [
+      {
+        "mainsnak": {
+          "snaktype": "value",
+          "datavalue": {
+            "value": {
+              "amount": "+240",
+              "unit": "http://www.wikidata.org/entity/Q11574"
+            }
+          }
+        }
+      }
+    ]
+  }
+}

@@ -240,6 +240,22 @@ impl<'de> Visitor<'de> for MainsnakVisitor {
 mod tests {
     use super::*;
 
+    /// Helper: the target Q-ID of the first claim for a property, or `None`.
+    fn first_claim_value(
+        claims: Option<&Vec<Claim>>,
+    ) -> Option<String> {
+        match claims {
+            Some(cs) if !cs.is_empty() => {
+                let dv = cs[0].mainsnak.as_ref().and_then(|m| m.datavalue.as_ref());
+                match dv {
+                    Some(v) => v.id.clone(),
+                    None => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     // --- Custom deserializer tests (Step 3) ---
 
     /// Value snaktype with entity ID.
@@ -617,6 +633,91 @@ mod tests {
                 prop
             );
         }
+    }
+
+    /// Load album work fixture: verify the album-class work claims.
+    ///
+    /// The work carries `P31` (album class `Q482994`), `P175` (featured
+    /// performers), and `P136` (genre) — the role-inversion fix routes it to
+    /// `album`, never to `artist`.
+    #[test]
+    fn test_load_album_work_fixture() {
+        let json = include_str!("../../tests/fixtures/album_work_entity.json");
+        let entity: Entity = serde_json::from_str(json).expect("deserialize album work");
+        assert_eq!(entity.id, "Q152873");
+        assert_eq!(
+            entity.labels.as_ref().and_then(|l| l.en()),
+            Some("The Joshua Tree")
+        );
+        assert_eq!(
+            first_claim_value(entity.claims.get("P31")),
+            Some("Q482994".into())
+        );
+        assert_eq!(
+            first_claim_value(entity.claims.get("P175")),
+            Some("Q396".into())
+        );
+        assert_eq!(
+            first_claim_value(entity.claims.get("P136")),
+            Some("Q35718".into())
+        );
+    }
+
+    /// Load song work fixture: verify track-class claims with a P2047
+    /// quantity datavalue (amount + unit) and a P361 parent album.
+    #[test]
+    fn test_load_song_work_fixture() {
+        let json = include_str!("../../tests/fixtures/song_work_entity.json");
+        let entity: Entity = serde_json::from_str(json).expect("deserialize song work");
+        assert_eq!(entity.id, "Q155849");
+        assert_eq!(
+            entity.labels.as_ref().and_then(|l| l.en()),
+            Some("With or Without You")
+        );
+        assert_eq!(
+            first_claim_value(entity.claims.get("P31")),
+            Some("Q7366".into())
+        );
+        assert_eq!(
+            first_claim_value(entity.claims.get("P361")),
+            Some("Q152873".into())
+        );
+        // P2047 is a quantity datavalue: amount + unit are captured.
+        let p2047 = entity.claims.get("P2047").expect("P2047 claim");
+        assert_eq!(p2047.len(), 1);
+        let dv = p2047[0].mainsnak.as_ref().expect("mainsnak").datavalue.clone();
+        assert_eq!(dv, Some(DatavalueValue {
+            amount: Some("+240".into()),
+            unit: Some("http://www.wikidata.org/entity/Q11574".into()),
+            precision: None,
+            id: None,
+            time: None,
+        }));
+    }
+
+    /// Load person agent with sitelinks fixture: the `enwiki` title falls
+    /// back for label extraction when no `en` label exists, and the P106
+    /// occupation classifies the entity as an agent.
+    #[test]
+    fn test_load_person_agent_sitelinks_fixture() {
+        let json = include_str!("../../tests/fixtures/person_agent_sitelinks.json");
+        let entity: Entity = serde_json::from_str(json).expect("deserialize person agent");
+        assert_eq!(entity.id, "Q2831");
+        assert_eq!(
+            first_claim_value(entity.claims.get("P106")),
+            Some("Q639669".into())
+        );
+        assert_eq!(
+            entity.labels.as_ref().and_then(|l| l.en()),
+            None,
+            "No en label: the sitelink title must be the fallback source"
+        );
+        let enwiki = entity
+            .sitelinks
+            .as_ref()
+            .and_then(|s| s.get("enwiki"))
+            .expect("enwiki sitelink present");
+        assert_eq!(enwiki.title, "Ivy_Queen");
     }
 
     /// Malformed JSON line: truncated JSON should return an error.

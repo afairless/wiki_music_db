@@ -710,4 +710,46 @@ mod tests {
         assert_ne!(roles[1], EntityRole::Agent);
         assert_eq!(format!("{:?}", EntityRole::Album), "Album");
     }
+
+    // -------------------------------------------------------------------
+    // Fixture-driven role classification (tests/fixtures/*)
+    // -------------------------------------------------------------------
+
+    /// Helper: classify the claims of a deserialized fixture entity.
+    fn classify_fixture(json: &str) -> Option<(EntityRole, String)> {
+        let entity: crate::wikidata::model::Entity =
+            serde_json::from_str(json).expect("deserialize fixture");
+        classify_entity(&entity.claims)
+    }
+
+    #[test]
+    fn test_classify_album_work_fixture() {
+        // The Joshua Tree (Q152873): album class beats the catch-all, so the
+        // work is Album even though it carries P175 (its performers).
+        let json = include_str!("../../tests/fixtures/album_work_entity.json");
+        assert_eq!(
+            classify_fixture(json),
+            Some((EntityRole::Album, "P31:Q482994".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_song_work_fixture() {
+        // With or Without You (Q155849): the song class routes to Track.
+        let json = include_str!("../../tests/fixtures/song_work_entity.json");
+        assert_eq!(
+            classify_fixture(json),
+            Some((EntityRole::Track, "P31:Q7366".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_person_agent_sitelinks_fixture() {
+        // Ivy Queen (Q2831): P106 occupation wins even without an en label.
+        let json = include_str!("../../tests/fixtures/person_agent_sitelinks.json");
+        assert_eq!(
+            classify_fixture(json),
+            Some((EntityRole::Agent, "P106:Q639669".into()))
+        );
+    }
 }

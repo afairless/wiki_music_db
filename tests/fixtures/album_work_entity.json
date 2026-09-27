@@ -1,0 +1,52 @@
+{
+  "id": "Q152873",
+  "type": "item",
+  "labels": {
+    "en": {
+      "value": "The Joshua Tree"
+    }
+  },
+  "descriptions": {
+    "en": {
+      "value": "1987 studio album by U2"
+    }
+  },
+  "claims": {
+    "P31": [
+      {
+        "mainsnak": {
+          "snaktype": "value",
+          "datavalue": {
+            "value": {
+              "id": "Q482994"
+            }
+          }
+        }
+      }
+    ],
+    "P175": [
+      {
+        "mainsnak": {
+          "snaktype": "value",
+          "datavalue": {
+            "value": {
+              "id": "Q396"
+            }
+          }
+        }
+      }
+    ],
+    "P136": [
+      {
+        "mainsnak": {
+          "snaktype": "value",
+          "datavalue": {
+            "value": {
+              "id": "Q35718"
+            }
+          }
+        }
+      }
+    ]
+  }
+}

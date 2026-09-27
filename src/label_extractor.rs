@@ -1092,6 +1092,53 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Fixture-driven enrichment tests (tests/fixtures/*)
+    // -------------------------------------------------------------------
+
+    /// Load a fixture entity and return it deserialized.
+    fn load_fixture_entity(json: &str) -> Entity {
+        serde_json::from_str::<Entity>(json).expect("deserialize fixture")
+    }
+
+    #[test]
+    fn test_song_work_fixture_duration_and_parent() {
+        // With or Without You (Q155849): P2047 amount 240s + unit Q11574
+        // yields a duration, and P361 names the parent album.
+        let json = include_str!("../tests/fixtures/song_work_entity.json");
+        let entity = load_fixture_entity(json);
+
+        let duration = extract_p2047_duration(&entity.claims["P2047"]);
+        assert_eq!(duration, Some("240".to_string()));
+
+        let (track_duration, parent) = extract_track_claims(&entity);
+        assert_eq!(track_duration, Some("240".to_string()));
+        assert_eq!(parent, Some("Q152873".to_string()));
+    }
+
+    #[test]
+    fn test_person_agent_sitelinks_fixture_label_fallback() {
+        // Ivy Queen (Q2831): no en label, so the sanitized `enwiki` title
+        // fills the label slot (contract §4 #2).
+        let json = include_str!("../tests/fixtures/person_agent_sitelinks.json");
+        let entity = load_fixture_entity(json);
+
+        let (label, description) = extract_label(&entity);
+        assert_eq!(label, Some("Ivy Queen".to_string()));
+        assert_eq!(description, None);
+    }
+
+    #[test]
+    fn test_album_work_fixture_album_claims() {
+        // The Joshua Tree (Q152873): the work's P136 genre feeds
+        // album_genre link extraction during populate.
+        let json = include_str!("../tests/fixtures/album_work_entity.json");
+        let entity = load_fixture_entity(json);
+
+        let (_, _, genre_qid) = extract_album_claims(&entity);
+        assert_eq!(genre_qid, Some("Q35718".to_string()));
+    }
+
+    // -------------------------------------------------------------------
     // Album genre extraction tests
     // -------------------------------------------------------------------
 

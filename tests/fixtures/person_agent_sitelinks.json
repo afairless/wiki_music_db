@@ -1,0 +1,26 @@
+{
+  "id": "Q2831",
+  "type": "item",
+  "sitelinks": {
+    "enwiki": {
+      "site": "enwiki",
+      "title": "Ivy_Queen",
+      "badges": [],
+      "url": "https://en.wikipedia.org/wiki/Ivy_Queen"
+    }
+  },
+  "claims": {
+    "P106": [
+      {
+        "mainsnak": {
+          "snaktype": "value",
+          "datavalue": {
+            "value": {
+              "id": "Q639669"
+            }
+          }
+        }
+      }
+    ]
+  }
+}
