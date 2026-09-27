@@ -1,13 +1,21 @@
-//! Music entity filter for Wikidata entities.
+//! Music entity filter and role classifier for Wikidata entities.
 //!
-//! Provides `is_music_entity()` which checks a Wikidata entity's claims
-//! against three criteria, in order of precision:
+//! [`classify_entity`] assigns every matching entity exactly one of three
+//! roles — [`EntityRole::Agent`] (people/groups), [`EntityRole::Album`]
+//! (album-class works) or [`EntityRole::Track`] (song-class works) — by
+//! checking claims in order of precision:
 //!
-//! 1. **Occupation (P106)** — does the entity have a music occupation?
-//! 2. **Group type (P31)** — is the entity a music group?
-//! 3. **Catch-all properties** — does the entity have music-related properties?
+//! 1. **Occupation (P106)** — music occupation → Agent.
+//! 2. **Group type (P31)** — music group class → Agent.
+//! 3. **Album work class (P31)** — album-class P31 → Album.
+//! 4. **Track work class (P31)** — song-class P31 → Track.
+//! 5. **Catch-all properties** — P1303/P175/P136/P358, only reached when no
+//!    work-class P31 is present → Agent.
 //!
-//! The first match wins. Every included entity records why it passed.
+//! The first match wins. Every included entity records why it passed
+//! ([`classify_entity`] returns the role alongside the reason).
+//! [`is_music_entity`] is a thin wrapper that discards the role, kept for
+//! callers and tests that only need the yes/no verdict.
 
 use std::collections::HashMap;
 
@@ -56,12 +64,71 @@ pub(crate) const MUSIC_GROUP_IDS: &[&str] = &[
     "Q1196129",   // vocal group
 ];
 
+/// P31 classes that identify *album-like works* (as opposed to agents).
+///
+/// A work in one of these classes carries `P175` (featured performers) and
+/// belongs in the `album` table, never in `artist`. Singles and EPs are
+/// classified as albums per the v1 schema intent ("Albums, EPs, singles,
+/// and compilation albums").
+///
+/// Curation (2026-09): every Q-ID below was verified by its English label
+/// against the local `qid_label` table and/or the Wikidata API; class labels
+/// are role-independent, so the pre-fix dump is a valid label source. The
+/// list is intentionally minimal: uncovered classes fall through to the
+/// catch-all (agent) path and are auditable via the `inclusion_reason`
+/// distribution.
+pub(crate) const ALBUM_WORK_CLASS_IDS: &[&str] = &[
+    "Q482994",  // album
+    "Q134556",  // single
+    "Q208569",  // studio album
+    "Q169930",  // extended play
+    "Q222910",  // compilation album
+    "Q209939",  // live album
+    "Q5610543", // demo
+    "Q963099",  // remix album
+    "Q723849",  // greatest hits album
+    "Q1892995", // mixtape
+    "Q217199",  // soundtrack
+    "Q5049564", // cast recording
+];
+
+/// P31 classes that identify *track-like works* (songs / instrumental pieces).
+///
+/// A work in one of these classes belongs in the `track` table; `P361` on the
+/// entity names its parent albums. Curation method is the same as
+/// [`ALBUM_WORK_CLASS_IDS`].
+pub(crate) const TRACK_WORK_CLASS_IDS: &[&str] = &[
+    "Q7366",     // song
+    "Q24887304", // instrumental composition
+    "Q639197",   // instrumental music
+];
+
 /// Properties that indicate a music-relevant entity (catch-all heuristic).
 pub(crate) const MUSIC_PROPERTIES: &[&str] = &["P1303", "P175", "P136", "P358"];
 
 /// Minimum number of catch-all properties required for inclusion.
 /// Set to 1 for a wide net (prioritises recall over precision).
 const MIN_CATCHALL_PROPERTIES: usize = 1;
+
+// ---------------------------------------------------------------------------
+// Entity roles
+// ---------------------------------------------------------------------------
+
+/// The role a music entity plays in the database.
+///
+/// Bootstrap and update routing use this to decide which tables an entity
+/// contributes rows to: agents → `artist` (and artist join tables), album-
+/// class works → `album` / `album_artist`, track-class works → `track` /
+/// `track_artist` / `track_album`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityRole {
+    /// A person or group: the subject of the `artist` table.
+    Agent,
+    /// An album-class work (album, single, EP, compilation, …).
+    Album,
+    /// A track-class work (song, instrumental piece, …).
+    Track,
+}
 
 // ---------------------------------------------------------------------------
 // Filter result type
@@ -95,39 +162,68 @@ impl FilterResult {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Determine whether a Wikidata entity is music-related based on its claims.
+/// Classify a Wikidata entity into its music role, if it is music-related.
 ///
-/// Checks three criteria in order of precision:
-/// 1. Music occupation (P106)
-/// 2. Music group type (P31)
-/// 3. Catch-all music-related properties
+/// Checks five criteria in order of precision:
+/// 1. Music occupation (P106)      → `Agent`
+/// 2. Music group type (P31)       → `Agent`
+/// 3. Album work class (P31)       → `Album`
+/// 4. Track work class (P31)       → `Track`
+/// 5. Catch-all music properties   → `Agent`
 ///
-/// The first match wins. Returns `FilterResult::Included(reason)` with a
-/// structured reason string, or `FilterResult::Excluded`.
-pub fn is_music_entity(claims: &HashMap<String, Vec<Claim>>) -> FilterResult {
-    // Check 1: Music occupation (P106)
+/// The first match wins. Rules 3–4 run before the catch-all so album/song
+/// works — which carry `P175` (performers) and `P136` (genre) — are never
+/// admitted as agents, removing the source of the historical role inversion.
+///
+/// Returns `Some((role, reason))` with a structured reason string, or `None`
+/// if the entity is not music-related.
+pub fn classify_entity(claims: &HashMap<String, Vec<Claim>>) -> Option<(EntityRole, String)> {
+    // Rule 1: Music occupation (P106)
     if let Some(stmts) = claims.get("P106") {
         for claim in stmts {
             if let Some(target) = claim_target_id(claim)
                 && MUSIC_OCCUPATION_IDS.contains(&target)
             {
-                return FilterResult::Included(format!("P106:{target}"));
+                return Some((EntityRole::Agent, format!("P106:{target}")));
             }
         }
     }
 
-    // Check 2: Music group type (P31)
+    // Rule 2: Music group type (P31)
     if let Some(stmts) = claims.get("P31") {
         for claim in stmts {
             if let Some(target) = claim_target_id(claim)
                 && MUSIC_GROUP_IDS.contains(&target)
             {
-                return FilterResult::Included(format!("P31:{target}"));
+                return Some((EntityRole::Agent, format!("P31:{target}")));
             }
         }
     }
 
-    // Check 3: Catch-all properties
+    // Rule 3: Album work class (P31)
+    if let Some(stmts) = claims.get("P31") {
+        for claim in stmts {
+            if let Some(target) = claim_target_id(claim)
+                && ALBUM_WORK_CLASS_IDS.contains(&target)
+            {
+                return Some((EntityRole::Album, format!("P31:{target}")));
+            }
+        }
+    }
+
+    // Rule 4: Track work class (P31)
+    if let Some(stmts) = claims.get("P31") {
+        for claim in stmts {
+            if let Some(target) = claim_target_id(claim)
+                && TRACK_WORK_CLASS_IDS.contains(&target)
+            {
+                return Some((EntityRole::Track, format!("P31:{target}")));
+            }
+        }
+    }
+
+    // Rule 5: Catch-all properties. Only reached when no work-class P31 is
+    // present (rules 3–4 would have matched it), so the entity is an agent.
     let matched: Vec<&str> = MUSIC_PROPERTIES
         .iter()
         .filter(|prop| claims.contains_key(**prop))
@@ -135,13 +231,25 @@ pub fn is_music_entity(claims: &HashMap<String, Vec<Claim>>) -> FilterResult {
         .collect();
 
     if matched.len() >= MIN_CATCHALL_PROPERTIES {
-        // Sort for deterministic ordering (the plan says sorted order)
+        // Sort for deterministic ordering
         let mut sorted = matched.clone();
         sorted.sort_unstable();
-        return FilterResult::Included(format!("PROP:{}", sorted.join(",")));
+        return Some((EntityRole::Agent, format!("PROP:{}", sorted.join(","))));
     }
 
-    FilterResult::Excluded
+    None
+}
+
+/// Determine whether a Wikidata entity is music-related based on its claims.
+///
+/// Thin wrapper over [`classify_entity`] that discards the role and keeps the
+/// historical `FilterResult` verdict, for callers and tests that only need the
+/// yes/no answer (e.g. the incremental-update path).
+pub fn is_music_entity(claims: &HashMap<String, Vec<Claim>>) -> FilterResult {
+    match classify_entity(claims) {
+        Some((_, reason)) => FilterResult::Included(reason),
+        None => FilterResult::Excluded,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -374,5 +482,232 @@ mod tests {
             Some("reason")
         );
         assert_eq!(FilterResult::Excluded.reason(), None);
+    }
+
+    // --- Role classification (classify_entity / EntityRole) ---
+
+    #[test]
+    fn test_classify_empty_claims_excluded() {
+        let claims = HashMap::new();
+        assert_eq!(classify_entity(&claims), None);
+    }
+
+    #[test]
+    fn test_classify_musician_agent() {
+        let claims = make_claims(vec![("P106", vec![claim_with_id("Q639669")])]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Agent, "P106:Q639669".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_group_agent() {
+        let claims = make_claims(vec![("P31", vec![claim_with_id("Q215380")])]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Agent, "P31:Q215380".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_album_not_artist() {
+        // An album work carries P175 (its performers) — it must be Album, not Agent.
+        let claims = make_claims(vec![
+            ("P31", vec![claim_with_id("Q482994")]), // album
+            ("P175", vec![claim_with_id("Q396")]),   // performer: U2
+        ]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Album, "P31:Q482994".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_studio_album() {
+        let claims = make_claims(vec![("P31", vec![claim_with_id("Q208569")])]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Album, "P31:Q208569".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_single_album() {
+        // Singles/EPs live in `album` per the v1 schema intent (plan question 5).
+        let claims = make_claims(vec![("P31", vec![claim_with_id("Q134556")])]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Album, "P31:Q134556".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_ep_album() {
+        let claims = make_claims(vec![("P31", vec![claim_with_id("Q169930")])]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Album, "P31:Q169930".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_compilation_album() {
+        let claims = make_claims(vec![("P31", vec![claim_with_id("Q222910")])]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Album, "P31:Q222910".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_live_album() {
+        let claims = make_claims(vec![("P31", vec![claim_with_id("Q209939")])]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Album, "P31:Q209939".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_song_track() {
+        let claims = make_claims(vec![("P31", vec![claim_with_id("Q7366")])]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Track, "P31:Q7366".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_instrumental_track() {
+        let claims = make_claims(vec![("P31", vec![claim_with_id("Q24887304")])]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Track, "P31:Q24887304".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_work_class_beats_catchall() {
+        // Album with a genre (P136): the work class wins over the catch-all,
+        // so the entity is not misclassified as an agent.
+        let claims = make_claims(vec![
+            ("P31", vec![claim_with_id("Q482994")]),
+            ("P136", vec![claim_with_id("Q35718")]), // rock music
+        ]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Album, "P31:Q482994".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_occupation_precedence_over_work_class() {
+        // Documented precedence: a music occupation (P106) beats any work-class
+        // P31 — such an entity is an agent.
+        let claims = make_claims(vec![
+            ("P106", vec![claim_with_id("Q639669")]),
+            ("P31", vec![claim_with_id("Q482994")]),
+        ]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Agent, "P106:Q639669".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_group_precedence_over_work_class() {
+        // Documented precedence: a music group P31 beats album/song classes
+        // when the same entity carries both (defensive ordering).
+        let claims = make_claims(vec![(
+            "P31",
+            vec![claim_with_id("Q215380"), claim_with_id("Q482994")],
+        )]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Agent, "P31:Q215380".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_album_class_beats_song_class() {
+        let claims = make_claims(vec![(
+            "P31",
+            vec![claim_with_id("Q7366"), claim_with_id("Q482994")],
+        )]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Album, "P31:Q482994".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_catchall_agent() {
+        // No occupation/group/work class — the catch-all admits an agent.
+        let claims = make_claims(vec![
+            ("P175", vec![claim_with_id("Q396")]),
+            ("P136", vec![claim_with_id("Q35718")]),
+        ]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Agent, "PROP:P136,P175".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_human_with_genre_is_agent() {
+        // A person without a music occupation but with a genre stays an agent
+        // (non-work P31 like Q5 does not beat the catch-all).
+        let claims = make_claims(vec![
+            ("P31", vec![claim_with_id("Q5")]),
+            ("P136", vec![claim_with_id("Q35718")]),
+        ]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Agent, "PROP:P136".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_non_music_excluded() {
+        let claims = make_claims(vec![
+            ("P31", vec![claim_with_id("Q5")]),
+            ("P569", vec![claim_with_id("Q42")]),
+        ]);
+        assert_eq!(classify_entity(&claims), None);
+    }
+
+    #[test]
+    fn test_classify_p31_claim_without_datavalue_id_skipped() {
+        // A P31 claim with no target is ignored; a later album class still wins.
+        let claims = make_claims(vec![(
+            "P31",
+            vec![claim_no_datavalue_id(), claim_with_id("Q482994")],
+        )]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Album, "P31:Q482994".into()))
+        );
+    }
+
+    #[test]
+    fn test_is_music_entity_wraps_classify() {
+        // The wrapper keeps the historical verdict shape for every role.
+        let album = make_claims(vec![("P31", vec![claim_with_id("Q482994")])]);
+        assert_eq!(
+            is_music_entity(&album),
+            FilterResult::Included("P31:Q482994".into())
+        );
+        let non_music = make_claims(vec![("P31", vec![claim_with_id("Q5")])]);
+        assert_eq!(is_music_entity(&non_music), FilterResult::Excluded);
+    }
+
+    #[test]
+    fn test_entity_role_derives() {
+        // EntityRole must be Copy + Eq for cheap role routing.
+        let roles = [EntityRole::Agent, EntityRole::Album, EntityRole::Track];
+        assert_eq!(roles[0], EntityRole::Agent);
+        assert_ne!(roles[1], EntityRole::Agent);
+        assert_eq!(format!("{:?}", EntityRole::Album), "Album");
     }
 }

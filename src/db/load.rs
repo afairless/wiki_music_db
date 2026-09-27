@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 use duckdb::Connection;
 
 use crate::extraction::{MusicEntity, extract_music_entity};
-use crate::wikidata::filter::is_music_entity;
+use crate::wikidata::filter::{classify_entity, is_music_entity};
 use crate::wikidata::model::Entity;
 use crate::wikidata::stream::FilteredEntity;
 
@@ -962,9 +962,16 @@ pub fn upsert_entity_from_json(conn: &Connection, entity: &Entity) -> Result<boo
 
     let inclusion_reason = filter_result.reason().unwrap_or("unknown").to_string();
 
+    // `is_music_entity` is a thin wrapper over `classify_entity`, so an
+    // Included verdict is guaranteed to carry a classified role as well.
+    let role = classify_entity(&entity.claims)
+        .expect("included filter result always yields a classified role")
+        .0;
+
     let filtered = FilteredEntity {
         entity: entity.clone(),
         inclusion_reason,
+        role,
     };
 
     let mut genre_qids = std::collections::HashSet::new();

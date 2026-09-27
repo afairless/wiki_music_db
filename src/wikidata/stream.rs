@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use flate2::read::MultiGzDecoder;
 
-use crate::wikidata::filter::{FilterResult, is_music_entity};
+use crate::wikidata::filter::{EntityRole, classify_entity};
 use crate::wikidata::model::Entity;
 
 // ---------------------------------------------------------------------------
@@ -22,6 +22,8 @@ use crate::wikidata::model::Entity;
 pub struct FilteredEntity {
     pub entity: Entity,
     pub inclusion_reason: String,
+    /// The classified role of this entity (`Agent`, `Album`, or `Track`).
+    pub role: EntityRole,
 }
 
 /// Events produced by the streaming parser.
@@ -121,15 +123,16 @@ impl StreamReader {
         match serde_json::from_str::<Entity>(line) {
             Ok(entity) => {
                 self.processed += 1;
-                match is_music_entity(&entity.claims) {
-                    FilterResult::Included(reason) => {
+                match classify_entity(&entity.claims) {
+                    Some((role, reason)) => {
                         self.filtered += 1;
                         Ok(Some(StreamEvent::Filtered(Box::new(FilteredEntity {
                             entity,
                             inclusion_reason: reason,
+                            role,
                         }))))
                     }
-                    FilterResult::Excluded => {
+                    None => {
                         // Valid entity but not music-related — skip silently
                         Ok(Some(StreamEvent::Skipped))
                     }
@@ -423,9 +426,56 @@ mod tests {
         let fe = FilteredEntity {
             inclusion_reason: "P106:Q639669".into(),
             entity,
+            role: EntityRole::Agent,
         };
 
         assert_eq!(fe.inclusion_reason, "P106:Q639669");
+        assert_eq!(fe.role, EntityRole::Agent);
         assert_eq!(fe.entity.id, "Q2831");
+    }
+
+    // --- Role wiring ---
+
+    #[test]
+    fn test_stream_album_entity_role() {
+        let content = make_dump(&[
+            "[",
+            r#"{"id":"Q152873","type":"item","claims":{"P31":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q482994"}}}}]}},"#,
+            "]",
+        ]);
+        let (_dir, path) = write_gz(&content);
+        let mut reader = StreamReader::new(&path).expect("open stream");
+        let events = read_all(&mut reader);
+
+        match &events[1] {
+            StreamEvent::Filtered(fe) => {
+                assert_eq!(fe.entity.id, "Q152873");
+                assert_eq!(fe.role, EntityRole::Album);
+                assert_eq!(fe.inclusion_reason, "P31:Q482994");
+            }
+            other => panic!("Expected Filtered, got {other:?}"),
+        }
+        assert_eq!(reader.filtered(), 1);
+    }
+
+    #[test]
+    fn test_stream_song_entity_role() {
+        let content = make_dump(&[
+            "[",
+            r#"{"id":"Q6649","type":"item","claims":{"P31":[{"mainsnak":{"snaktype":"value","datavalue":{"value":{"id":"Q7366"}}}}]}},"#,
+            "]",
+        ]);
+        let (_dir, path) = write_gz(&content);
+        let mut reader = StreamReader::new(&path).expect("open stream");
+        let events = read_all(&mut reader);
+
+        match &events[1] {
+            StreamEvent::Filtered(fe) => {
+                assert_eq!(fe.entity.id, "Q6649");
+                assert_eq!(fe.role, EntityRole::Track);
+                assert_eq!(fe.inclusion_reason, "P31:Q7366");
+            }
+            other => panic!("Expected Filtered, got {other:?}"),
+        }
     }
 }

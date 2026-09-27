@@ -462,6 +462,9 @@ mod tests {
                 claims,
             },
             inclusion_reason: inclusion_reason.into(),
+            // Extraction tests exercise agent-shaped entities; role-aware
+            // fixtures arrive with the extraction step.
+            role: crate::wikidata::filter::EntityRole::Agent,
         }
     }
 
