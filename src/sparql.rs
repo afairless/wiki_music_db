@@ -35,8 +35,10 @@ use crate::wikidata::filter;
 ///
 /// The query replicates the music filter logic from `src/wikidata/filter.rs`
 /// using SPARQL UNIONs: all music occupation Q-IDs (P106), all music group
-/// Q-IDs (P31), and a catch-all for music-related properties (P1303, P175,
-/// P136, P358).
+/// Q-IDs (P31), all album and track work-class Q-IDs (P31), and a catch-all
+/// for music-related properties (P1303, P175, P136, P358). The work-class
+/// UNIONs ensure the update path can retrieve work-class-only entities that
+/// carry no occupation, group type, or catch-all property.
 ///
 /// The `since` parameter is interpolated as a SPARQL literal. It is a
 /// trusted application-side value, not user input.
@@ -61,8 +63,29 @@ pub fn build_modified_query(since: &str, limit: u64, offset: u64) -> String {
         .collect::<Vec<_>>()
         .join(" UNION\n");
 
-    // Catch-all properties (P1303, P175, P136, P358)
-    let catchall_props = filter::MUSIC_PROPERTIES.join("|");
+    // Build the album work class filter UNION block (P31 ∈ ALBUM_WORK_CLASS_IDS)
+    let album_work_union: String = filter::ALBUM_WORK_CLASS_IDS
+        .iter()
+        .map(|qid| format!("    {{ ?item wdt:P31 wd:{qid} }}"))
+        .collect::<Vec<_>>()
+        .join(" UNION\n");
+
+    // Build the track work class filter UNION block (P31 ∈ TRACK_WORK_CLASS_IDS)
+    let track_work_union: String = filter::TRACK_WORK_CLASS_IDS
+        .iter()
+        .map(|qid| format!("    {{ ?item wdt:P31 wd:{qid} }}"))
+        .collect::<Vec<_>>()
+        .join(" UNION\n");
+
+    // Catch-all properties (P1303, P175, P136, P358). Every alternative must
+    // be a fully qualified prefixed name (`wdt:P1303`, never `P1303`): SPARQL
+    // tokenizes `|`-joined alternatives as separate IRIs, so an unqualified
+    // name parses as an unbound prefix and the endpoint answers HTTP 400.
+    let catchall_props = filter::MUSIC_PROPERTIES
+        .iter()
+        .map(|prop| format!("wdt:{prop}"))
+        .collect::<Vec<_>>()
+        .join("|");
 
     // Build the full query
     format!(
@@ -73,6 +96,10 @@ pub fn build_modified_query(since: &str, limit: u64, offset: u64) -> String {
 {occupation_union}
   }} UNION {{
 {group_union}
+  }} UNION {{
+{album_work_union}
+  }} UNION {{
+{track_work_union}
   }} UNION {{
     ?item wdt:{catchall_props} [] .
   }}
@@ -466,6 +493,54 @@ mod tests {
                 query.contains(prop),
                 "Query should contain catch-all property {}",
                 prop
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_modified_query_qualifies_catchall_property_alternatives() {
+        // Defect A regression: every `|`-joined alternative in the catch-all
+        // property path must be a fully qualified prefixed name (`wdt:P1303`,
+        // never `P1303`). An unqualified name tokenizes as an unbound prefix
+        // and the SPARQL endpoint answers HTTP 400. Expectations are derived
+        // from `filter::MUSIC_PROPERTIES`, not hardcoded.
+        let query = build_modified_query("2026-07-17T00:00:00Z", 10000, 0);
+
+        // The fully qualified alternatives must appear, joined with `|`.
+        let qualified = filter::MUSIC_PROPERTIES
+            .iter()
+            .map(|prop| format!("wdt:{prop}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(
+            query.contains(&qualified),
+            "Query should contain the qualified catch-all property path {qualified}"
+        );
+
+        // No adjacent alternative may be left unqualified: `wdt:<p0>|<p1>`
+        // (the v2 defect shape) must not appear anywhere in the query.
+        for pair in filter::MUSIC_PROPERTIES.windows(2) {
+            assert!(
+                !query.contains(&format!("wdt:{}|{}", pair[0], pair[1])),
+                "Query must not contain the unqualified catch-all alternative wdt:{}|{}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_modified_query_replicates_work_class_blocks() {
+        // The update path must retrieve work-class-only entities (Fix A scope):
+        // every album and track work class appears as its own P31 UNION block.
+        let query = build_modified_query("2026-07-17T00:00:00Z", 10000, 0);
+        for qid in filter::ALBUM_WORK_CLASS_IDS
+            .iter()
+            .chain(filter::TRACK_WORK_CLASS_IDS)
+        {
+            assert!(
+                query.contains(&format!("wdt:P31 wd:{qid}")),
+                "Query should contain work class P31 {qid}"
             );
         }
     }
