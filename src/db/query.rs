@@ -67,7 +67,7 @@ SELECT id, name, description, artist_type, birth_date, death_date
 FROM artist
 WHERE name LIKE '%' || ?1 || '%'
    OR description LIKE '%' || ?1 || '%'
-ORDER BY name
+ORDER BY (name = ?1) DESC, name
 LIMIT 100";
 
 /// Search artists by name using FTS when available, falling back to LIKE.
@@ -84,8 +84,9 @@ LIMIT 100";
 ///
 /// # Returns
 ///
-/// A vector of matching [`ArtistSearchResult`] rows, sorted by name.
-/// Returns an empty vec when no matches are found.
+/// A vector of matching [`ArtistSearchResult`] rows, exact-name matches
+/// ranked first (per imperfect-match convention) and the rest sorted by
+/// name. Returns an empty vec when no matches are found.
 pub fn search_artist(conn: &Connection, term: &str) -> Result<Vec<ArtistSearchResult>> {
     if term.is_empty() {
         return Ok(Vec::new());
@@ -105,6 +106,12 @@ pub fn search_artist(conn: &Connection, term: &str) -> Result<Vec<ArtistSearchRe
 }
 
 /// FTS-based artist search.
+///
+/// FTS is inert in the bundled DuckDB build (see module docs), so this path
+/// is unreachable today. When it is ever activated it MUST keep exact-name
+/// matches first — `ORDER BY` cannot express FTS ranking here — or the fixed
+/// exact-name ranking below is silently lost and Defect B (band U2 hidden
+/// behind description-substring rows) resurfaces.
 fn search_artist_fts(conn: &Connection, term: &str) -> Result<Vec<ArtistSearchResult>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, description, artist_type, birth_date, death_date \
@@ -680,6 +687,66 @@ mod tests {
 
         let results = search_artist(&conn, "").unwrap();
         assert!(results.is_empty(), "Empty term should return empty vec");
+    }
+
+    #[test]
+    fn test_search_artist_exact_name_ranks_first() {
+        // Defect B regression: the band "U2" (exact name match) must rank
+        // ahead of description-substring rows and name-superstring rows that
+        // also match the term.
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO artist (id, name, artist_type, description) VALUES \
+             ('Q555', NULL, 'group', 'Vocal track by U2'), \
+             ('Q1', 'Miles Davis', 'person', 'Jazz trumpeter'), \
+             ('Q396', 'U2', 'group', 'Irish rock band'), \
+             ('Q556', 'U2 fan club', 'group', 'Fan club of U2')",
+            [],
+        )
+        .unwrap();
+
+        let results = search_artist(&conn, "U2").unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(
+            results[0].id, "Q396",
+            "Exact-name row must rank before description-substring rows"
+        );
+        assert_eq!(
+            results[0].name.as_deref(),
+            Some("U2"),
+            "Exact-name row is the band itself"
+        );
+    }
+
+    #[test]
+    fn test_search_artist_exact_name_survives_spillover_limit() {
+        // Defect B spillover regression: when >100 rows match the term, the
+        // single exact-name row must not be pushed past the LIMIT 100 by
+        // description-substring rows.
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO artist (id, name, artist_type) \
+             VALUES ('Q396', 'U2', 'group')",
+            [],
+        )
+        .unwrap();
+        let mut stmt = conn
+            .prepare(
+                "INSERT INTO artist (id, name, artist_type, description) \
+                 VALUES (?, ?, 'group', 'Recording by U2')",
+            )
+            .unwrap();
+        for i in 0..120 {
+            stmt.execute(params![format!("Q5{:03}", i), format!("Artist {}", i)])
+                .unwrap();
+        }
+
+        let results = search_artist(&conn, "U2").unwrap();
+        assert_eq!(results.len(), 100, "Spillover rows are capped by LIMIT 100");
+        assert_eq!(
+            results[0].id, "Q396",
+            "Exact-name row must survive the LIMIT 100"
+        );
     }
 
     #[test]
