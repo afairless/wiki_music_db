@@ -360,3 +360,9 @@ to the agent catch-all as before — a *measured* divergence, not a defect).
 
 Curation evidence appended to `2026-09_fix_entity_role_inversion.md` §7
 (gate paragraph) in the same commit series.
+
+### Step 4 — v2 archive + `cargo audit` (2026-09-29)
+
+- Archived `music-v2.duckdb` → `music-v2-battery-20260928.duckdb` (`mv -n`, 1.14 GB, in place).
+- `cargo audit` (0.22.1): **no new deps from this series** (fixes A–C touched no `Cargo.toml`/lockfile). Pre-existing transitive findings, out of this plan's scope, flagged for a follow-up task: `h2 0.4.15` (RUSTSEC-2026-0258, fix ≥ 0.4.16, via reqwest 0.12.28), `rustls 0.23.42` (RUSTSEC-2026-0285, medium, fix ≥ 0.23.45, via libduckdb-sys/ureq + hyper-rustls), `paste 1.0.15` (RUSTSEC-2024-0436, unmaintained, via parquet 59.1.0).
+- Release build `cargo build --release` succeeds on the fixed tree.
