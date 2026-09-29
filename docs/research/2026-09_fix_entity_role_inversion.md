@@ -261,6 +261,8 @@ Run against `music-v2.duckdb`:
 
 **Gate:** checks 2, 4, 5, 6 are only reachable once `ALBUM_WORK_CLASS_IDS` / `TRACK_WORK_CLASS_IDS` curation (Step 2, golden-corpus audit) is complete. If a material share of known albums still falls to the catch-all/agent path, extend the lists and re-run bootstrap before treating the battery as valid. Record the `inclusion_reason` distribution audit in the Step 10 run notes.
 
+**Step 2 curation evidence (2026-09-29, `2026-09_verify_rebuild_fixes.md` §7 run notes):** the 51-work golden-corpus audit found zero album-class misses (all 25 albums → `Q482994`/`Q169930`) and one material song-class miss, `Q55850593` (music track with vocals, live COUNT ≈ 32 K) — added to `TRACK_WORK_CLASS_IDS` (U2 "40" Q113111952 is the §7 gate entity for the vox rebuild). The generic musical-work parent `Q105543609` (~208 K live) was **not** added: it is the catch-all that would re-unify the roles (see gate wording extension in `2026-09_verify_rebuild_fixes.md` §2.4/§8 — the condition covers album **and** track classes alike).
+
 ## 8. Risks / Pitfalls
 
 - **P31 work-class coverage**: without P279 subclass resolution, any album class absent from the curated list silently falls to the catch-all (agent) path. Mitigation: unit-test the classifier against the known golden corpus (U2, Vivaldi, Ellington directories in `/home/tr/mp3_files`) and audit `inclusion_reason` distribution during Step 10.

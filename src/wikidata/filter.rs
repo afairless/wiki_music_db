@@ -97,8 +97,21 @@ pub(crate) const ALBUM_WORK_CLASS_IDS: &[&str] = &[
 /// A work in one of these classes belongs in the `track` table; `P361` on the
 /// entity names its parent albums. Curation method is the same as
 /// [`ALBUM_WORK_CLASS_IDS`].
+///
+/// Curation (2026-09-29, golden-corpus audit, see
+/// `docs/research/2026-09_verify_rebuild_fixes.md` run notes): `Q55850593`
+/// ("music track with vocals", a sub-class of `Q7302866`) was added after the
+/// §7 gate caught U2 "40" (Q113111952) landing in `artist` — its P31 was in
+/// neither list. Audit evidence: Q113111952 (P31 = Q55850593) and "Old Town
+/// Road" (Q62587323, P31 = Q55850593) from a 51-work golden corpus; live
+/// instance count **32,125** (SPARQL COUNT, 2026-09-29). The generic
+/// "musical work/composition" class (Q105543609, ~208 K live instances,
+/// present on 16/26 golden songs) is deliberately **not** listed: it is the
+/// catch-all musical-work parent, and adding it would route every work —
+/// albums included — to the track role (role pollution).
 pub(crate) const TRACK_WORK_CLASS_IDS: &[&str] = &[
     "Q7366",     // song
+    "Q55850593", // music track with vocals
     "Q24887304", // instrumental composition
     "Q639197",   // instrumental music
 ];
@@ -584,6 +597,36 @@ mod tests {
         assert_eq!(
             classify_entity(&claims),
             Some((EntityRole::Track, "P31:Q24887304".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_vocal_track() {
+        // Fix C regression: a vocal single whose P31 is Q55850593 ("music
+        // track with vocals" — e.g. U2's "40", Q113111952) is a track, not
+        // an agent, even though it carries catch-all properties (P175/P136).
+        let claims = make_claims(vec![
+            ("P31", vec![claim_with_id("Q55850593")]),
+            ("P175", vec![claim_with_id("Q396")]), // featured performer: U2
+            ("P136", vec![claim_with_id("Q35718")]), // rock music
+        ]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Track, "P31:Q55850593".into()))
+        );
+    }
+
+    #[test]
+    fn test_classify_vocal_track_with_parent_album() {
+        // A vocal track carrying P361 (its parent album) stays a track; the
+        // P361 target feeds the `track_album` junction, never `artist`.
+        let claims = make_claims(vec![
+            ("P31", vec![claim_with_id("Q55850593")]),
+            ("P361", vec![claim_with_id("Q152873")]),
+        ]);
+        assert_eq!(
+            classify_entity(&claims),
+            Some((EntityRole::Track, "P31:Q55850593".into()))
         );
     }
 

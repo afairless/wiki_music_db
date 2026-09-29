@@ -378,7 +378,7 @@ Each filtered entity is classified into exactly one role (see
 
 - **agent** (people and groups) → `artist` and its join tables
 - **album** (albums, EPs, singles, compilations, …) → `album`, `album_artist`, `album_genre`
-- **track** (songs, instrumentals, …) → `track`, `track_artist`, `track_album`
+- **track** (songs, vocal tracks, instrumentals, …) → `track`, `track_artist`, `track_album`
 
 ```
 artist               — Core entity: person (musician) or group (band)

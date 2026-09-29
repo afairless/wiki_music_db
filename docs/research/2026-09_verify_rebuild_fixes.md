@@ -318,3 +318,45 @@ battery still fails, investigate before swapping.
   existing `music-v1-inverted.duckdb`.
 - Re-run tripwire: if the genre pass ever projects days again, measure the
   rate and stop before letting it run.
+---
+
+## 7. Run notes
+
+### Fix C golden-corpus audit (2026-09-29, §4 method)
+
+Method: 51 famous works (albums, EPs, singles, songs, 1960s–2020s) resolved
+to Q-IDs **live** via exact enwiki sitelink titles (one SPARQL `VALUES`
+query), P31 fetched via the same endpoint; class labels resolved via
+`rdfs:label`. All 51 resolved.
+
+Album-kind (25/25 covered — **0 album-class misses**): every golden album
+carries `P31 = Q482994` (album) or, for the EP, `Q169930` — e.g. The Joshua
+Tree, Thriller, Abbey Road, Nevermind, Kind of Blue, OK Computer, Born to
+Run, Dark Side of the Moon, Blue, Back in Black, Rumours, Revolver, Pet
+Sounds, good kid m.A.A.d city, Lemonade, Currents, Jar of Flies (EP), …
+
+Song-kind (26 works):
+
+| P31 (label) | Golden works | Verdict |
+|---|---|---|
+| `Q105543609` musical work/composition | 16 (incl. Sunday Bloody Sunday, Bohemian Rhapsody, Billie Jean, Stairway to Heaven, Yesterday, Imagine, Wonderwall) | **Not added** — catch-all musical-work parent; live COUNT ≈ **208,382**; adding it would re-unify roles (§3 discipline) |
+| `Q55850593` music track with vocals | 2 (U2 "40" Q113111952 — the §7 gate entity; "Old Town Road" Q62587323) | **Added → `TRACK_WORK_CLASS_IDS`**; live COUNT = **32,125** (2026-09-29; plan baseline ≈ 32 K confirmed) |
+| `Q134556` single (covered) | 7 (Respect, Blinding Lights, Formation, Hips Don't Lie, Losing My Religion, What's Going On, WAP) | already in `ALBUM_WORK_CLASS_IDS` |
+| `Q134556`+`Q7366` (covered) | 1 (Shape of You) | already covered |
+| `Q134556`+`Q55850593` | 1 (Old Town Road) | covered once `Q55850593` is listed |
+
+Audit caveats: the enwiki "40 (song)" sitelink resolves to the Wikidata
+duplicate twin `Q2313537` (P31 = `Q105543609`); the §7 gate entity is
+`Q113111952` (label "40", desc "vocal track by U2", P31 = `Q55850593`).
+Both are real U2 "40" records — a known Wikidata data-quality duplicate the
+pipeline does not try to reconcile (non-goal). "Rumours" title resolves to
+a disambiguation page; the album (Q695405) carries `Q482994`.
+
+Expected deltas (¶6, not gates): `Q55850593` adds ≈ 32 K tracks at bootstrap;
+`artist` PROP-catch-all rows shrink by the moved 32 K; `track_album` rises
+toward the P361 envelope (check #4) only where those tracks carry P361
+parents. `Q105543609` remains an accepted residual (≈ 208 K live works fall
+to the agent catch-all as before — a *measured* divergence, not a defect).
+
+Curation evidence appended to `2026-09_fix_entity_role_inversion.md` §7
+(gate paragraph) in the same commit series.
