@@ -48,65 +48,139 @@ use crate::wikidata::filter;
 /// Never panics in practice. The `result.unwrap()` on the interpolated format
 /// string is safe because the template is fixed and the `since` value is a
 /// string that can always be formatted.
-pub fn build_modified_query(since: &str, limit: u64, offset: u64) -> String {
-    // Build the occupation filter UNION block
-    let occupation_union: String = filter::MUSIC_OCCUPATION_IDS
-        .iter()
-        .map(|qid| format!("    {{ ?item wdt:P106 wd:{qid} }}"))
-        .collect::<Vec<_>>()
-        .join(" UNION\n");
+/// Safety cap on pages fetched for a single branch (10k pages × 10k/page
+/// ≈ 100M entities) — guards against a non-advancing cursor loop.
+const MAX_PAGES_PER_BRANCH: u64 = 10_000;
 
-    // Build the group type filter UNION block
-    let group_union: String = filter::MUSIC_GROUP_IDS
-        .iter()
-        .map(|qid| format!("    {{ ?item wdt:P31 wd:{qid} }}"))
-        .collect::<Vec<_>>()
-        .join(" UNION\n");
+/// A single matching-predicate scan ("branch") of the update-path recall
+/// query.
+///
+/// The endpoint cannot serve the former 51-way UNION with `ORDER BY` inside
+/// its 60 s execution budget (measured HTTP 504 for any `--since` window), and
+/// it does not push an outer-scope `dateModified` FILTER into UNION branches.
+/// Each branch is therefore queried on its own, with the date filter (and,
+/// from page two onward, a keyset cursor bound) written **inside** the branch
+/// block so the engine prunes before sorting. Branches are kept small: the
+/// catch-all property *path* (`P1303|P175|P136|P358`) is split into four
+/// single-property branches — the combined path alone 504s (measured
+/// 2026-09-30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MusicBranch {
+    /// `?item wdt:P106 wd:<qid>` — a music occupation.
+    Occupation(&'static str),
+    /// `?item wdt:P31 wd:<qid>` — a music group type or album/track work class.
+    Class(&'static str),
+    /// `?item wdt:<prop> []` — a single catch-all property (P1303/P175/P136/P358).
+    Property(&'static str),
+}
 
-    // Build the album work class filter UNION block (P31 ∈ ALBUM_WORK_CLASS_IDS)
-    let album_work_union: String = filter::ALBUM_WORK_CLASS_IDS
-        .iter()
-        .map(|qid| format!("    {{ ?item wdt:P31 wd:{qid} }}"))
-        .collect::<Vec<_>>()
-        .join(" UNION\n");
+impl MusicBranch {
+    /// `wdt:`-predicated triple body for the `{ }` block (with trailing dot).
+    fn triple(&self) -> String {
+        match self {
+            MusicBranch::Occupation(qid) => format!("?item wdt:P106 wd:{qid}"),
+            MusicBranch::Class(qid) => format!("?item wdt:P31 wd:{qid}"),
+            MusicBranch::Property(prop) => format!("?item wdt:{prop} []"),
+        }
+    }
 
-    // Build the track work class filter UNION block (P31 ∈ TRACK_WORK_CLASS_IDS)
-    let track_work_union: String = filter::TRACK_WORK_CLASS_IDS
-        .iter()
-        .map(|qid| format!("    {{ ?item wdt:P31 wd:{qid} }}"))
-        .collect::<Vec<_>>()
-        .join(" UNION\n");
+    /// Short human-readable label for logging and error context.
+    fn label(&self) -> String {
+        match self {
+            MusicBranch::Occupation(qid) => format!("occupation {qid}"),
+            MusicBranch::Class(qid) => format!("class {qid}"),
+            MusicBranch::Property(prop) => format!("property {prop}"),
+        }
+    }
+}
 
-    // Catch-all properties (P1303, P175, P136, P358). Every alternative must
-    // be a fully qualified prefixed name (`wdt:P1303`, never `P1303`): SPARQL
-    // tokenizes `|`-joined alternatives as separate IRIs, so an unqualified
-    // name parses as an unbound prefix and the endpoint answers HTTP 400.
-    let catchall_props = filter::MUSIC_PROPERTIES
-        .iter()
-        .map(|prop| format!("wdt:{prop}"))
-        .collect::<Vec<_>>()
-        .join("|");
+/// Every branch the update path must scan.
+///
+/// Mirrors the bootstrap filter's inclusion constants exactly:
+/// 19 occupations + 12 group classes + 12 album work classes + 4 track work
+/// classes + 4 catch-all properties = 51 branches. Coverage is derived from
+/// the `filter` constants so the two paths cannot drift apart.
+pub(crate) fn all_music_branches() -> Vec<MusicBranch> {
+    let mut branches = Vec::with_capacity(51);
+    branches.extend(
+        filter::MUSIC_OCCUPATION_IDS
+            .iter()
+            .map(|qid| MusicBranch::Occupation(qid)),
+    );
+    branches.extend(
+        filter::MUSIC_GROUP_IDS
+            .iter()
+            .chain(filter::ALBUM_WORK_CLASS_IDS)
+            .chain(filter::TRACK_WORK_CLASS_IDS)
+            .map(|qid| MusicBranch::Class(qid)),
+    );
+    branches.extend(
+        filter::MUSIC_PROPERTIES
+            .iter()
+            .map(|prop| MusicBranch::Property(prop)),
+    );
+    branches
+}
 
-    // Build the full query
+/// Build a single-branch SPARQL query for the update path.
+///
+/// The `dateModified` triple and its FILTER are written **inside** the branch
+/// block: live measurements (2026-09-30) show the endpoint answers this shape
+/// within its 60 s budget for incremental windows, while an outer-scope FILTER
+/// times out (504) for any window. `after` is the keyset cursor — the last
+/// Q-ID of the previous page (results are `ORDER BY ?item` ascending, so it is
+/// the page maximum); the bound is emitted inside the branch block too, so
+/// later pages only sort the still-outstanding slice.
+///
+/// Q-ID ordering is lexicographic over the uniform `Q\d+` keyspace — a total
+/// order, so keyset pagination never skips; numeric order is immaterial
+/// because callers consume the scan as a set.
+pub(crate) fn build_branch_query(
+    since: &str,
+    branch: MusicBranch,
+    limit: u64,
+    after: Option<&str>,
+) -> String {
+    let keyset = after
+        .map(|cursor| format!(" FILTER(?item > wd:{cursor})"))
+        .unwrap_or_default();
     format!(
         "SELECT DISTINCT ?item WHERE {{
-  ?item schema:dateModified ?modified .
-  FILTER(?modified >= \"{since}\"^^xsd:dateTime)
-  {{
-{occupation_union}
-  }} UNION {{
-{group_union}
-  }} UNION {{
-{album_work_union}
-  }} UNION {{
-{track_work_union}
-  }} UNION {{
-    ?item wdt:{catchall_props} [] .
-  }}
+  {{ {triple} .
+    ?item schema:dateModified ?modified .
+    FILTER(?modified >= \"{since}\"^^xsd:dateTime){keyset} }}
 }}
 ORDER BY ?item
-LIMIT {limit} OFFSET {offset}"
+LIMIT {limit}",
+        triple = branch.triple(),
     )
+}
+
+/// Advance the keyset cursor one page.
+///
+/// A short page (< `page_size`) means the branch scan is exhausted. A full
+/// page advances the cursor to its last element (the page maximum in
+/// `ORDER BY ?item` order); the cursor must strictly advance, or the loop
+/// would repeat the same page forever.
+fn next_keyset_cursor(
+    page: &[String],
+    page_size: usize,
+    previous: Option<&str>,
+) -> Result<Option<String>> {
+    if page.len() < page_size {
+        return Ok(None);
+    }
+    let Some(last) = page.last() else {
+        // Unreachable: `page.len() >= page_size > 0`. Degrade to exhaustion
+        // rather than panicking on an impossible state.
+        return Ok(None);
+    };
+    if previous == Some(last.as_str()) {
+        anyhow::bail!(
+            "pagination cursor did not advance past {last} — the endpoint repeated a page"
+        );
+    }
+    Ok(Some(last.clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -217,59 +291,80 @@ impl SparqlClient {
 
     /// Async implementation of `query_modified_entities`.
     ///
-    /// Paginates through the SPARQL endpoint, collecting all modified entity
-    /// Q-IDs. Deduplicates across pages to handle potential ordering issues.
+    /// Scans every [`MusicBranch`] sequentially with keyset pagination — the
+    /// endpoint cannot serve a single 51-way UNION (or an OFFSET scan) within
+    /// its execution budget; see [`MusicBranch`] docs for the measurements —
+    /// and deduplicates the union across branches. A failing branch fails the
+    /// whole sync on purpose: a branch that silently dropped out would lose
+    /// its slice of the music universe forever, and per-page retries already
+    /// absorb transient endpoint timeouts.
     async fn query_modified_entities_async(&self, since: &str) -> Result<Vec<String>> {
         let mut all_qids: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut offset: u64 = 0;
-        let page_size = self.page_size;
 
-        loop {
-            let query = build_modified_query(since, page_size, offset);
-            tracing::debug!(
-                offset,
-                page_size,
-                "Querying SPARQL endpoint for modified entities"
-            );
+        for branch in all_music_branches() {
+            let mut after: Option<String> = None;
+            let mut pages_fetched: u64 = 0;
+            loop {
+                let query = build_branch_query(since, branch, self.page_size, after.as_deref());
+                tracing::debug!(
+                    branch = %branch.label(),
+                    cursor = after.as_deref().unwrap_or("(start)"),
+                    page_size = self.page_size,
+                    "Querying SPARQL endpoint for modified entities"
+                );
 
-            let qids = self
-                .execute_query_with_retry(&query, offset)
-                .await
-                .with_context(|| {
-                    format!(
-                        "SPARQL query failed at offset {} (page size {})",
-                        offset, page_size
-                    )
-                })?;
+                let page = self
+                    .execute_query_with_retry(&query, &branch.label(), after.as_deref())
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "SPARQL query failed for branch {} (page size {})",
+                            branch.label(),
+                            self.page_size
+                        )
+                    })?;
 
-            let new_count = qids.len();
-            for qid in &qids {
-                if seen.insert(qid.clone()) {
-                    all_qids.push(qid.clone());
+                let new_count = page.len();
+                for qid in &page {
+                    if seen.insert(qid.clone()) {
+                        all_qids.push(qid.clone());
+                    }
+                }
+
+                tracing::debug!(
+                    branch = %branch.label(),
+                    fetched = new_count,
+                    total_unique = all_qids.len(),
+                    "SPARQL page results"
+                );
+
+                match next_keyset_cursor(&page, self.page_size as usize, after.as_deref())? {
+                    Some(cursor) => after = Some(cursor),
+                    None => break,
+                }
+
+                pages_fetched += 1;
+                if pages_fetched > MAX_PAGES_PER_BRANCH {
+                    anyhow::bail!(
+                        "branch {} exceeded {} pages — cursor scan did not terminate",
+                        branch.label(),
+                        MAX_PAGES_PER_BRANCH
+                    );
                 }
             }
-
-            tracing::debug!(
-                offset,
-                fetched = new_count,
-                total_unique = all_qids.len(),
-                "SPARQL page results"
-            );
-
-            // If fewer results than page size, we've reached the last page
-            if new_count < page_size as usize {
-                break;
-            }
-
-            offset += page_size;
         }
 
         Ok(all_qids)
     }
 
     /// Execute a single SPARQL query with retry logic and exponential backoff.
-    async fn execute_query_with_retry(&self, query: &str, offset: u64) -> Result<Vec<String>> {
+    async fn execute_query_with_retry(
+        &self,
+        query: &str,
+        branch: &str,
+        cursor: Option<&str>,
+    ) -> Result<Vec<String>> {
         let mut last_error: Option<anyhow::Error> = None;
 
         for attempt in 0..=self.max_retries {
@@ -279,7 +374,8 @@ impl SparqlClient {
                     attempt,
                     max_retries = self.max_retries,
                     backoff_ms = backoff.as_millis(),
-                    offset,
+                    branch,
+                    cursor = cursor.unwrap_or("(start)"),
                     "Retrying SPARQL query after failure"
                 );
                 tokio::time::sleep(backoff).await;
@@ -297,13 +393,20 @@ impl SparqlClient {
     }
 
     /// Execute a single SPARQL query without retry logic.
+    ///
+    /// Sends the query as a raw **POST** body (`application/sparql-query`):
+    /// the branch queries are too long for nginx's GET URI limit (measured
+    /// HTTP 414 on the 51-branch shape). The `format=json` hint rides as a
+    /// URL query parameter.
     async fn execute_query_once(&self, query: &str) -> Result<Vec<String>> {
         let response = self
             .client
-            .get(&self.endpoint_url)
-            .query(&[("format", "json"), ("query", query)])
+            .post(&self.endpoint_url)
+            .query(&[("format", "json")])
+            .header("Content-Type", "application/sparql-query")
             .header("Accept", "application/sparql-results+json")
             .header("User-Agent", &self.user_agent)
+            .body(query.to_string())
             .send()
             .await
             .context("Failed to send SPARQL query request")?;
@@ -416,149 +519,245 @@ mod tests {
     use crate::wikidata::filter;
 
     // -----------------------------------------------------------------------
-    // build_modified_query tests
+    // Branch query builder tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_build_modified_query_contains_since() {
-        let query = build_modified_query("2026-07-17T00:00:00Z", 10000, 0);
+    fn test_build_branch_query_contains_since() {
+        let query = build_branch_query(
+            "2026-07-17T00:00:00Z",
+            MusicBranch::Property("P136"),
+            10000,
+            None,
+        );
         assert!(
-            query.contains("2026-07-17T00:00:00Z"),
-            "Query should contain the since timestamp"
+            query.contains("FILTER(?modified >= \"2026-07-17T00:00:00Z\"^^xsd:dateTime)"),
+            "Query should contain the since timestamp inside the branch"
         );
     }
 
     #[test]
-    fn test_build_modified_query_contains_limit_and_offset() {
-        let query = build_modified_query("2026-07-17T00:00:00Z", 5000, 10000);
+    fn test_build_branch_query_contains_limit_and_order_by() {
+        let query = build_branch_query(
+            "2026-07-17T00:00:00Z",
+            MusicBranch::Occupation("Q639669"),
+            5000,
+            None,
+        );
+        assert!(
+            query.contains("ORDER BY ?item"),
+            "Query should sort by item for a stable keyset"
+        );
         assert!(
             query.contains("LIMIT 5000"),
             "Query should contain LIMIT 5000"
         );
         assert!(
-            query.contains("OFFSET 10000"),
-            "Query should contain OFFSET 10000"
+            !query.contains("OFFSET"),
+            "Keyset pagination must not use OFFSET"
         );
     }
 
     #[test]
-    fn test_build_modified_query_contains_order_by() {
-        let query = build_modified_query("2026-07-17T00:00:00Z", 10000, 0);
+    fn test_build_branch_query_single_branch_no_union() {
+        // One branch per query: a 51-way UNION exceeds the endpoint's 60 s
+        // execution budget even when every branch carries its own date filter
+        // (measured HTTP 504, 2026-09-30).
+        let query = build_branch_query(
+            "2026-07-17T00:00:00Z",
+            MusicBranch::Class("Q482994"),
+            10000,
+            None,
+        );
         assert!(
-            query.contains("ORDER BY"),
-            "Query should contain ORDER BY clause"
+            !query.contains("UNION"),
+            "A single-branch query must not contain UNION"
         );
     }
 
     #[test]
-    fn test_build_modified_query_contains_schema_datemodified() {
-        let query = build_modified_query("2026-07-17T00:00:00Z", 10000, 0);
+    fn test_build_branch_query_occupation_triple() {
+        let query = build_branch_query(
+            "2026-07-17T00:00:00Z",
+            MusicBranch::Occupation("Q177220"),
+            10000,
+            None,
+        );
         assert!(
-            query.contains("schema:dateModified"),
-            "Query should filter by dateModified"
+            query.contains("?item wdt:P106 wd:Q177220 ."),
+            "Occupation branch should emit the qualified triple followed by a dot"
         );
     }
 
     #[test]
-    fn test_build_modified_query_contains_all_occupation_qids() {
-        let query = build_modified_query("2026-07-17T00:00:00Z", 10000, 0);
+    fn test_build_branch_query_class_triple() {
+        let query = build_branch_query(
+            "2026-07-17T00:00:00Z",
+            MusicBranch::Class("Q482994"),
+            10000,
+            None,
+        );
+        assert!(
+            query.contains("?item wdt:P31 wd:Q482994 ."),
+            "Class branch should emit the P31 triple"
+        );
+    }
+
+    #[test]
+    fn test_build_branch_query_property_triple() {
+        for prop in filter::MUSIC_PROPERTIES {
+            let query = build_branch_query(
+                "2026-07-17T00:00:00Z",
+                MusicBranch::Property(prop),
+                10000,
+                None,
+            );
+            assert!(
+                query.contains(&format!("?item wdt:{prop} [] .")),
+                "Property branch should emit the {prop} existential triple"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_branch_query_date_filter_in_branch_body() {
+        // Live finding (2026-09-30): the endpoint does not push an
+        // outer-scope dateModified FILTER into UNION branches (HTTP 504 for
+        // any window); with the triple + FILTER inside the branch block it
+        // answers within budget. The date bindings must live inside the
+        // `{ }` block, not above it.
+        let query = build_branch_query(
+            "2026-07-17T00:00:00Z",
+            MusicBranch::Property("P136"),
+            10000,
+            None,
+        );
+        let branch_start = query.find('{').expect("query should open a block");
+        let branch_end = query.rfind('}').expect("query should close a block");
+        assert!(
+            branch_start < branch_end,
+            "query should have a well-formed block"
+        );
+        let body = &query[branch_start..branch_end];
+        assert!(
+            body.contains("schema:dateModified"),
+            "dateModified triple must be inside the branch block"
+        );
+        assert!(
+            body.contains("FILTER(?modified >="),
+            "date FILTER must be inside the branch block"
+        );
+    }
+
+    #[test]
+    fn test_build_branch_query_keyset_cursor() {
+        let with_cursor = build_branch_query(
+            "2026-07-17T00:00:00Z",
+            MusicBranch::Property("P136"),
+            10000,
+            Some("Q123456"),
+        );
+        assert!(
+            with_cursor.contains("FILTER(?item > wd:Q123456)"),
+            "Keyset cursor should emit FILTER(?item > wd:<qid>)"
+        );
+
+        let without_cursor = build_branch_query(
+            "2026-07-17T00:00:00Z",
+            MusicBranch::Property("P136"),
+            10000,
+            None,
+        );
+        assert!(
+            !without_cursor.contains("FILTER(?item >"),
+            "First page must not carry a keyset bound"
+        );
+    }
+
+    #[test]
+    fn test_build_branch_query_no_property_alternation() {
+        // Defect A regression (kept, strengthened): the old shape joined
+        // unqualified property IDs with `|` (HTTP 400). The new shape splits
+        // every property onto its own branch, so no alternation may appear.
+        for prop in filter::MUSIC_PROPERTIES {
+            let query = build_branch_query(
+                "2026-07-17T00:00:00Z",
+                MusicBranch::Property(prop),
+                10000,
+                None,
+            );
+            assert!(
+                !query.contains('|'),
+                "{prop} branch must not contain `|`-joined property alternatives"
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_music_branches_covers_filter_constants() {
+        let branches = all_music_branches();
+        let expected = filter::MUSIC_OCCUPATION_IDS.len()
+            + filter::MUSIC_GROUP_IDS.len()
+            + filter::ALBUM_WORK_CLASS_IDS.len()
+            + filter::TRACK_WORK_CLASS_IDS.len()
+            + filter::MUSIC_PROPERTIES.len();
+        assert_eq!(
+            branches.len(),
+            expected,
+            "branch count must match the filter constants"
+        );
+
+        let rendered: Vec<String> = branches.iter().map(|b| b.triple()).collect();
         for qid in filter::MUSIC_OCCUPATION_IDS {
             assert!(
-                query.contains(&format!("wd:{qid}")),
-                "Query should contain occupation QID {}",
-                qid
+                rendered.contains(&format!("?item wdt:P106 wd:{qid}")),
+                "missing occupation branch {qid}"
             );
         }
-    }
-
-    #[test]
-    fn test_build_modified_query_contains_all_group_qids() {
-        let query = build_modified_query("2026-07-17T00:00:00Z", 10000, 0);
-        for qid in filter::MUSIC_GROUP_IDS {
-            assert!(
-                query.contains(&format!("wd:{qid}")),
-                "Query should contain group QID {}",
-                qid
-            );
-        }
-    }
-
-    #[test]
-    fn test_build_modified_query_contains_catchall_properties() {
-        let query = build_modified_query("2026-07-17T00:00:00Z", 10000, 0);
-        // The catch-all uses a property path: wdt:P1303|wdt:P175|wdt:P136|wdt:P358
-        // Check that the union block for catch-all properties is present
-        for prop in filter::MUSIC_PROPERTIES {
-            assert!(
-                query.contains(prop),
-                "Query should contain catch-all property {}",
-                prop
-            );
-        }
-    }
-
-    #[test]
-    fn test_build_modified_query_qualifies_catchall_property_alternatives() {
-        // Defect A regression: every `|`-joined alternative in the catch-all
-        // property path must be a fully qualified prefixed name (`wdt:P1303`,
-        // never `P1303`). An unqualified name tokenizes as an unbound prefix
-        // and the SPARQL endpoint answers HTTP 400. Expectations are derived
-        // from `filter::MUSIC_PROPERTIES`, not hardcoded.
-        let query = build_modified_query("2026-07-17T00:00:00Z", 10000, 0);
-
-        // The fully qualified alternatives must appear, joined with `|`.
-        let qualified = filter::MUSIC_PROPERTIES
+        for qid in filter::MUSIC_GROUP_IDS
             .iter()
-            .map(|prop| format!("wdt:{prop}"))
-            .collect::<Vec<_>>()
-            .join("|");
-        assert!(
-            query.contains(&qualified),
-            "Query should contain the qualified catch-all property path {qualified}"
-        );
-
-        // No adjacent alternative may be left unqualified: `wdt:<p0>|<p1>`
-        // (the v2 defect shape) must not appear anywhere in the query.
-        for pair in filter::MUSIC_PROPERTIES.windows(2) {
-            assert!(
-                !query.contains(&format!("wdt:{}|{}", pair[0], pair[1])),
-                "Query must not contain the unqualified catch-all alternative wdt:{}|{}",
-                pair[0],
-                pair[1]
-            );
-        }
-    }
-
-    #[test]
-    fn test_build_modified_query_replicates_work_class_blocks() {
-        // The update path must retrieve work-class-only entities (Fix A scope):
-        // every album and track work class appears as its own P31 UNION block.
-        let query = build_modified_query("2026-07-17T00:00:00Z", 10000, 0);
-        for qid in filter::ALBUM_WORK_CLASS_IDS
-            .iter()
+            .chain(filter::ALBUM_WORK_CLASS_IDS)
             .chain(filter::TRACK_WORK_CLASS_IDS)
         {
             assert!(
-                query.contains(&format!("wdt:P31 wd:{qid}")),
-                "Query should contain work class P31 {qid}"
+                rendered.contains(&format!("?item wdt:P31 wd:{qid}")),
+                "missing class branch {qid}"
+            );
+        }
+        for prop in filter::MUSIC_PROPERTIES {
+            assert!(
+                rendered.contains(&format!("?item wdt:{prop} []")),
+                "missing property branch {prop}"
             );
         }
     }
 
     #[test]
-    fn test_build_modified_query_has_no_empty_union() {
-        // Verify the UNION blocks are not empty
-        let query = build_modified_query("2026-07-17T00:00:00Z", 10000, 0);
-        assert!(
-            query.contains("UNION"),
-            "Query should contain UNION operators"
+    fn test_next_keyset_cursor_short_page_finishes() {
+        let page = vec!["Q1".to_string(), "Q2".to_string()];
+        assert_eq!(
+            next_keyset_cursor(&page, 10, None).unwrap(),
+            None,
+            "a short page means the scan is exhausted"
         );
-        // Count UNIONs: at least 2 (occupation → group, group → catch-all)
-        let union_count = query.matches("UNION").count();
+    }
+
+    #[test]
+    fn test_next_keyset_cursor_full_page_advances() {
+        let page: Vec<String> = (1..=10).map(|n| format!("Q{n}")).collect();
+        let cursor = next_keyset_cursor(&page, 10, None)
+            .unwrap()
+            .expect("a full page should advance the cursor");
+        assert_eq!(cursor, "Q10", "cursor should be the last (maximum) item");
+    }
+
+    #[test]
+    fn test_next_keyset_cursor_stall_errors() {
+        let page: Vec<String> = (1..=10).map(|n| format!("Q{n}")).collect();
+        let err = next_keyset_cursor(&page, 10, Some("Q10")).unwrap_err();
         assert!(
-            union_count >= 2,
-            "Query should have at least 2 UNIONs, got {}",
-            union_count
+            err.to_string().contains("did not advance"),
+            "a repeated cursor must be detected as a stall: {err}"
         );
     }
 

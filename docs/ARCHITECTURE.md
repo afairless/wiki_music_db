@@ -69,7 +69,7 @@
 | **Extraction** | `src/extraction.rs` | `extract_music_entity()` — converts `FilteredEntity` → `MusicEntity`; role-aware P175 (featured performers) / P361 (parent albums) mapping | `model`, `stream` |
 | **Parquet writer** | `src/parquet_writer.rs` | `MusicEntityBatchWriter` — batch-writes `MusicEntity` to rotating Parquet files; `role` and `parents` columns | `extraction`, `parquet`, `arrow` |
 | **Label extractor** | `src/label_extractor.rs` | `collect_qid_set()` (Q-IDs referenced in the DB) + `extract_labels_and_claims()` (dump rescan → labels/enrichment Parquet) — Aho-Corasick substring scan; en-label → `enwiki` sitelink-title fallback; P2047 duration from datavalue `amount` | `parquet`, `arrow`, `aho-corasick` |
-| **SPARQL client** | `src/sparql.rs` | SPARQL query builder (`build_modified_query`) + HTTP client (async `reqwest` in a Tokio runtime) for `update` | `reqwest`, `tokio` |
+| **SPARQL client** | `src/sparql.rs` | Per-branch SPARQL query builder (`all_music_branches()` × `build_branch_query()`, keyset-paginated) + HTTP client (async `reqwest` in a Tokio runtime) for `update` | `reqwest`, `tokio` |
 | **Schema** | `src/db/schema.rs` | `initialize()` — creates all 16 tables (schema v2), indexes, and seeds `schema_version` | `duckdb` |
 | **Loader** | `src/db/load.rs` | `load_all()` (bootstrap Parquet → DuckDB, role-routed: agents → artist tables, album/track works → their tables + junctions); `load_label_and_enrichment()` + `backfill_all_safe()` (populate backfill via FK-safe temp-table swap); `upsert_entity_from_json()` (role-routed incremental updates) | `duckdb`, `schema` |
 | **Queries** | `src/db/query.rs` | Search + detail queries used by `cmd_query` (`search_artist`, `search_album`, `album_tracks`, `genre_artists`, …) | `duckdb` |
@@ -186,8 +186,11 @@ latest-all.json.gz
    sync_state.last_sync (key/value row)
         │
         ▼
-   build_modified_query(since)     SPARQL query for music entities modified
-   (src/sparql.rs)                 since the last sync (replicates the filter)
+   all_music_branches() × build_branch_query()
+   (src/sparql.rs)                 per-branch keyset SPARQL queries for music
+                                   entities modified since the last sync
+                                   (replicates the filter; each branch
+                                   paginates via FILTER(?item > cursor))
         │ modified Q-IDs (JSON results)
         ▼
    fetch_entity(qid)               Wikimedia REST API: full entity JSON per Q-ID
