@@ -251,15 +251,15 @@ Run against `music-v2.duckdb`:
 | 1 | Role separation | `SELECT count(*) FROM album a JOIN artist ar ON a.id=ar.id` | ≈ 0 (allow tiny Wikidata oddities, <0.1%) |
 | 2 | Real album searchable | `SELECT name FROM album WHERE name ILIKE '%joshua tree%'` | includes "The Joshua Tree" |
 | 3 | Artist→albums | `SELECT al.name FROM album_artist aa JOIN artist ar ON ar.id=aa.artist_id JOIN album al ON al.id=aa.album_id WHERE ar.name='U2'` | non-empty, real U2 albums |
-| 4 | track_album junction | `SELECT count(*) FROM track_album` | ≥ 7,000 (of 7,194 P361 rows) — conditional on track/album class coverage (see gate below) |
-| 5 | Durations | `SELECT count(*) FROM track WHERE duration_seconds IS NOT NULL` | ≥ 100 (before: 0); spot-check a known song's duration |
-| 6 | release_date | `SELECT count(*) FROM album WHERE release_date IS NOT NULL` | ≥ 1,000 (≈5× the old 197) |
-| 7 | Labels | `SELECT count(*) FROM album WHERE name ~ '^Q[0-9]+$'` | below the old 3,930 (sitelink fallback) |
+| 4 | track_album junction | `SELECT count(*) FROM track_album` | ≥ 7,000 (of 7,194 P361 rows) — **conditional** on track/album class coverage (see gate below). v3 measured **1,992** (kernel/agent rows moved out by Fix C); measured, accepted divergence — record, do not tune |
+| 5 | Durations | `SELECT count(*) FROM track WHERE duration_seconds IS NOT NULL` | ≥ 100 (before: 0); spot-check a known song's duration — v3: **13,037** |
+| 6 | release_date | `SELECT count(*) FROM album WHERE release_date IS NOT NULL` | ≥ 1,000 (≈5× the old 197); v3: **401,290** |
+| 7 | Labels | `SELECT count(*) FROM album WHERE name ~ '^Q[0-9]+$'` | below the old 3,930 (sitelink fallback) — v3: **77,940** (77,939 label-less, 4.05× the v1 row count; accepted divergence, see verify doc §2.1) |
 | 8 | Queries | `cargo run --release -- query album --name "Joshua Tree"` | hits; `query artist --name "U2"` → agent |
 | 9 | Update path | `cargo run --release -- update --dry-run`; upsert a work entity via the REST-entity shape | lands in `album`/`track` with performer junctions, never `artist` (no inverted `album_artist` rows) |
 | 10 | Quality | `cargo test && cargo clippy -- -D warnings && cargo fmt --check` | clean |
 
-**Gate:** checks 2, 4, 5, 6 are only reachable once `ALBUM_WORK_CLASS_IDS` / `TRACK_WORK_CLASS_IDS` curation (Step 2, golden-corpus audit) is complete. If a material share of known albums still falls to the catch-all/agent path, extend the lists and re-run bootstrap before treating the battery as valid. Record the `inclusion_reason` distribution audit in the Step 10 run notes.
+**Gate:** checks 2, 4, 5, 6 are only reachable once `ALBUM_WORK_CLASS_IDS` / `TRACK_WORK_CLASS_IDS` curation (Step 2, golden-corpus audit) is complete. If a material share of **known music works (albums or tracks)** still falls to the catch-all/agent path, extend the corresponding class list and re-run bootstrap before treating the battery as valid. Record the `inclusion_reason` distribution audit in the Step 10 run notes. (v3: gate passed — Q113111952 "40" lands in `track`, not `artist`, after the Q55850593 class fix.)
 
 **Step 2 curation evidence (2026-09-29, `2026-09_verify_rebuild_fixes.md` §7 run notes):** the 51-work golden-corpus audit found zero album-class misses (all 25 albums → `Q482994`/`Q169930`) and one material song-class miss, `Q55850593` (music track with vocals, live COUNT ≈ 32 K) — added to `TRACK_WORK_CLASS_IDS` (U2 "40" Q113111952 is the §7 gate entity for the vox rebuild). The generic musical-work parent `Q105543609` (~208 K live) was **not** added: it is the catch-all that would re-unify the roles (see gate wording extension in `2026-09_verify_rebuild_fixes.md` §2.4/§8 — the condition covers album **and** track classes alike).
 

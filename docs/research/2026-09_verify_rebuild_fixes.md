@@ -1,7 +1,8 @@
 # Research: Verification Battery Fixes & Rebuild
 
 **Date:** 2026-09-29
-**Status:** Plan (ready to execute)
+**Status:** Implemented
+**Implemented:** 2026-09-30 — closes with commits `400a16d` (sparql: qualify alternatives + work-class UNIONs), `83816df` (query: exact-name ranking), `f27179d` + `b6c93c4` (extraction: work-class lists + audit record), `aa3fa6b` (sparql: keyset pagination), plus this docs commit (v3 battery results + swap). See git log. Battery v3 passed all gates (run notes §8); swap executed 2026-09-30 (v3 → `~/wiki_db/music.duckdb`, v1 → `music-v1-inverted.duckdb`).
 **References:**
 
 - [2026-09_bootstrap_genre_scan_rebuild.md](./2026-09_bootstrap_genre_scan_rebuild.md) — the v2 build plan (executed 2026-09-27/28)
@@ -366,3 +367,64 @@ Curation evidence appended to `2026-09_fix_entity_role_inversion.md` §7
 - Archived `music-v2.duckdb` → `music-v2-battery-20260928.duckdb` (`mv -n`, 1.14 GB, in place).
 - `cargo audit` (0.22.1): **no new deps from this series** (fixes A–C touched no `Cargo.toml`/lockfile). Pre-existing transitive findings, out of this plan's scope, flagged for a follow-up task: `h2 0.4.15` (RUSTSEC-2026-0258, fix ≥ 0.4.16, via reqwest 0.12.28), `rustls 0.23.42` (RUSTSEC-2026-0285, medium, fix ≥ 0.23.45, via libduckdb-sys/ureq + hyper-rustls), `paste 1.0.15` (RUSTSEC-2024-0436, unmaintained, via parquet 59.1.0).
 - Release build `cargo build --release` succeeds on the fixed tree.
+
+### Steps 5–6 — v3 bootstrap + populate (2026-09-29/30)
+
+- Fresh parquet `/tmp/tag_agent_parquet_v3` (never reused v2/v1 dirs); bootstrap
+  launched via `run_v3_chain.sh` (nohup) — log `/tmp/verify_bootstrap3.log`.
+- Stage markers: `Streaming phase complete processed=120986270 filtered=2680525
+  rejected=0 genre_qids=13507` → `Genre label extraction complete genre_count=13082`
+  → `Loading complete: 13082 genres, 2196882 artists, 2194714 artist_genre,
+  230931 artist_instrument, 41438 artist_member_of, 443626 albums, 40017 tracks`
+  → `=== Bootstrap Complete ===`. (Track count 40,017 ≈ 8,380 v2 + 31,966 from the
+  Q55850593 class — the Fix C delta lands as projected.)
+- Populate (chained automatically, log `/tmp/verify_populate3.log`):
+  `Extracted labels and claims from dump labels=1003779 enrichment=483643
+  discovered_labels=11234` → `FK-safe backfill committed successfully` →
+  `Loaded enrichment data instruments=1279 record_labels=7971 album_genres=259146
+  track_albums=1992` → `=== Populate Complete ===` (Albums 365687, Tracks 30891,
+  Artists 1707018).
+
+### Step 7 — battery v3 (2026-09-30, against rebuilt `~/wiki_db/music-v2.duckdb`)
+
+Run with `--config /tmp/battery.toml` (db → `music-v2.duckdb`) for CLI checks.
+
+| # | Check | v3 measured | Verdict |
+|---|---|---|---|
+| 1 | role separation `album.id ∩ artist.id` | **0** | ✅ unchanged |
+| 2 | Joshua Tree searchable | "The Joshua Tree" (Q152873) + "Live from Joshua Tree" | ✅ |
+| 3 | U2 → albums | 128 `album_artist` rows | ✅ |
+| 4 | `track_album` count | **1,992** (v2: 1,395; P361 envelope) | ⚠️ gate-conditioned — improved, measured, accepted |
+| 5 | durations populated | **13,037** | ✅ (v1 0 → v2 271 → v3 13,037) |
+| 6 | `album.release_date` populated | **401,290** | ✅ |
+| 7 | QID-mirror album names | **77,940** (v2-identical; 77,939 have NULL labels) | ⚠️ accepted divergence — genuine label-less residual |
+| 8a | `query artist --name U2` | band U2 (**Q396**) is first hit | ✅ fixed |
+| 8b | `query album --name "Joshua Tree"` | both albums hit | ✅ |
+| 9 | `update --dry-run` | **HTTP 200**, 1,292 modified entities, 0 failed | ✅ fixed (was HTTP 400) |
+| 10 | test/clippy/fmt | clean — 393 tests pass (incl. Fix A-C unit tests) | ✅ |
+
+Gate: "40" (Q113111952) lives in `track` (not `artist`; `in_artist=0 in_album=0
+in_track=1`) with `track_artist`/`track_album` → U2. (The separately-P31'd twin
+Q2313537 remains musical-work catch-all per the §7 audit caveat.)
+
+`inclusion_reason` audit (top rows): `PROP:P136` 1,522,655 · `P106:Q177220`
+116,691 · `P31:Q215380` 98,985 · `P106:Q639669` 98,586 · `P106:Q36834` 96,046 ·
+`PROP:P175` 83,214 · `PROP:P136,P175` 47,429 · `PROP:P1303` 21,062 — property
+catch-all still dominates by design; the vocal-track class no longer pollutes
+`artist`. Check #4/#7 remain accepted divergences with the same root causes as
+v2 (§2.1) — measured, not tuned to.
+
+### Step 8 — swap + close-out (2026-09-30, user decision)
+
+```bash
+mv -n /home/tr/wiki_db/music.duckdb /home/tr/wiki_db/music-v1-inverted.duckdb
+mv -n /home/tr/wiki_db/music-v2.duckdb /home/tr/wiki_db/music.duckdb
+```
+
+- Swap executed and verified: `music.duckdb` mtime/1.15 GB = v3 build; default
+  `wiki_db.toml` (`~/wiki_db/music.duckdb`) serves v3 — `query artist --name "U2"`
+  returns band Q396 first, `query album --name "Joshua Tree"` returns both albums.
+- v1 (inverted) archived to `music-v1-inverted.duckdb`; v2 battery artifact stays
+  at `music-v2-battery-20260928.duckdb` (this doc's comparison baseline).
+- No further code changes: only this docs commit closes the plan.
+
